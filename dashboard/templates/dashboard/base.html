@@ -7,7 +7,6 @@
     {% endblock %}
 
     {% load static %}
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <link href="{% static 'dashboard/css/bootstrap.min.css'%}" rel="stylesheet">
     <link href="{% static 'dashboard/css/sticky-footer-navbar.css'%}" rel="stylesheet">
     <script src="https://code.jquery.com/jquery-3.3.1.slim.min.js" integrity="sha384-q8i/X+965DzO0rT7abK41JStQIAqVgRVzpbzo5smXKp4YfRvH+8abtTE1Pi6jizo" crossorigin="anonymous"></script>
@@ -35,9 +34,11 @@
 
         <div class="col-md-3 text-end">
             {% if user.is_authenticated %}
-                <p>Привет, {{ user.email }}
-                <a href="{% url 'user:logout' %}" class="btn btn-primary">Выход</a>
-                </p>
+                <p>Привет, {{ user.email }}</p>
+                <form action="{% url 'user:logout' %}" method="post">
+                    {% csrf_token %}
+                    <button type="submit" class="btn btn-primary">Выход</button>
+                </form>
             {% else %}
                 <a href="{% url 'user:auth' %}" class="btn btn-primary">Войти</a>
             {% endif %}

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["poetry-core>=2.0,<3"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "tinkoff-investments"
+version = "0.2.0b59"
+description = "Unofficially repackaged upstream Tinkoff Invest Python SDK"
+authors = ["Danil Akhtarov <d.akhtarov@tinkoff.ru>"]
+license = "Apache-2.0"
+readme = "UPSTREAM-README.md"
+repository = "https://github.com/Tinkoff/invest-python"
+homepage = "https://github.com/Tinkoff/invest-python"
+packages = [{ include = "tinkoff" }]
+exclude = ["tinkoff/__init__.py"]
+
+[tool.poetry.dependencies]
+python = ">=3.8"
+cachetools = ">=5.2,<6"
+grpcio = ">=1.39,<2"
+protobuf = ">=4.21.6,<5"
+python-dateutil = ">=2.8.2,<3"
+deprecation = ">=2.1,<3"

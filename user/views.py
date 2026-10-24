@@ -1,64 +1,51 @@
 from django.contrib.auth import authenticate, login, logout
 from django.shortcuts import redirect, render
-from django.views.generic import View
+from django.views import View
 
 from .forms import AuthForm, RegistrationForm
 
 
 class AuthView(View):
-    """Авторизация"""
+    """Авторизация."""
 
-    @staticmethod
-    def get(request):
-        return render(request, "user/auth.html", {"form": AuthForm})
+    def get(self, request):
+        return render(request, "user/auth.html", {"form": AuthForm()})
 
-    @staticmethod
-    def post(request):
+    def post(self, request):
         form = AuthForm(request.POST)
-        user = authenticate(
-            request, username=form.data["email"].lower(), password=form.data["password"]
-        )
+        if not form.is_valid():
+            return render(request, "user/auth.html", {"form": form})
 
-        if user is not None:
-            login(request, user)
-            return redirect("dashboard:index")
-        else:
-            return render(
-                request,
-                "user/auth.html",
-                {
-                    "form": form,
-                    "error": "Неверный логин или пароль! Повторите попытку.",
-                },
-            )
+        email = form.cleaned_data["email"].strip().lower()
+        password = form.cleaned_data["password"]
+        user = authenticate(request, username=email, password=password)
+        if user is None:
+            form.add_error(None, "Неверный логин или пароль! Повторите попытку.")
+            return render(request, "user/auth.html", {"form": form})
+
+        login(request, user)
+        return redirect("dashboard:index")
 
 
 class RegistrationView(View):
-    """Регистрация"""
+    """Регистрация."""
 
-    @staticmethod
-    def get(request):
-        return render(request, "user/registration.html", {"form": RegistrationForm})
+    def get(self, request):
+        return render(request, "user/registration.html", {"form": RegistrationForm()})
 
-    @staticmethod
-    def post(request):
+    def post(self, request):
         form = RegistrationForm(request.POST)
-        if form.is_valid():
-            user = form.save()
-            login(request, user)
-            return redirect("dashboard:index")
-        else:
-            return render(
-                request,
-                "user/registration.html",
-                {"form": form, "error": form.errors["__all__"].data[0].message},
-            )
+        if not form.is_valid():
+            return render(request, "user/registration.html", {"form": form})
+
+        user = form.save()
+        login(request, user)
+        return redirect("dashboard:index")
 
 
 class LogoutView(View):
-    """Выход"""
+    """Выход."""
 
-    @staticmethod
-    def get(request):
+    def post(self, request):
         logout(request)
         return redirect("dashboard:index")

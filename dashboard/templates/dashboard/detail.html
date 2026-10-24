@@ -20,9 +20,13 @@
     <div class="col3"></div>
     <div class="col3">
     <h5>Исторические данные: </h5>
- {% autoescape off %}
-  {{ plot_div }}
-  {% endautoescape %}
+    {% if graph_error %}
+        <p role="alert">{{ graph_error }}</p>
+    {% else %}
+        {% autoescape off %}
+            {{ plot_div }}
+        {% endautoescape %}
+    {% endif %}
     </div>
     <div class="col3"></div>
     </div>
