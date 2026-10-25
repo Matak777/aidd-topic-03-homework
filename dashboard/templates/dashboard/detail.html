@@ -9,8 +9,24 @@
     <div class="col3"></div>
     <div class="col3">
         Инструмент: {{ share.name }} <br>
-        Текущая цена: {{ share.last_price }} {{ share.currency }} <br>
+        {% if share.last_price is not None %}
+            Цена: {{ share.last_price }} {{ share.currency }} <br>
+            {% if share.last_price_source == "tinkoff" %}
+                Источник последней цены: Tinkoff Invest, время котировки:
+                {{ share.last_price_observed_at|date:"Y-m-d H:i:s T" }} <br>
+            {% elif share.last_price_source == "manual" %}
+                Значение введено вручную и не подтверждено как котировка. <br>
+            {% else %}
+                Источник последней цены не подтверждён. <br>
+            {% endif %}
+        {% else %}
+            Подтверждённая живая цена недоступна. <br>
+        {% endif %}
         Время последнего обновления: {{ share.updated_at }}
+        <br>
+        <a class="btn btn-outline-primary mt-2" href="{% url 'dashboard:history' share.pk %}">
+            История цен
+        </a>
     </div>
     <div class="col3"></div>
     </div>

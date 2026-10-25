@@ -1,15 +1,43 @@
 import logging
 import math
 from collections import namedtuple
+from datetime import datetime, timedelta, timezone as datetime_timezone
+from decimal import Decimal
 
 import grpc
 from django.conf import settings
+from django.utils import timezone
+
+from dashboard.models import PriceObservation
 
 logger = logging.getLogger("main")
 
 
 class MarketDataError(RuntimeError):
     """Raised when market data cannot be obtained from the provider."""
+
+
+def _quotation_to_decimal(quotation):
+    return Decimal(quotation.units) + Decimal(quotation.nano).scaleb(-9)
+
+
+def record_price_observation(share, price, observed_at, source):
+    if not isinstance(observed_at, datetime):
+        raise MarketDataError("Источник цены не передал время котировки.")
+    if not timezone.is_aware(observed_at):
+        observed_at = timezone.make_aware(observed_at, datetime_timezone.utc)
+
+    observation, _created = PriceObservation.objects.get_or_create(
+        share=share,
+        source=source,
+        observed_at=observed_at,
+        defaults={
+            "price": price,
+            "currency": share.currency,
+            "received_at": timezone.now(),
+        },
+    )
+    return observation
 
 
 class _ClientCallDetails(
@@ -85,6 +113,38 @@ def get_client():
 
 
 def get_last_data(share):
+    if settings.PRICE_DATA_MODE == "demo":
+        observed_at = timezone.now()
+        latest_demo_observation = (
+            PriceObservation.objects.filter(
+                share=share,
+                source=PriceObservation.Source.DEMO,
+            )
+            .order_by("-observed_at")
+            .first()
+        )
+        if (
+            latest_demo_observation is not None
+            and observed_at <= latest_demo_observation.observed_at
+        ):
+            observed_at = latest_demo_observation.observed_at + timedelta(
+                microseconds=1
+            )
+        previous_price = (
+            latest_demo_observation.price
+            if latest_demo_observation is not None
+            else Decimal("100.00")
+        )
+        value = previous_price + Decimal("0.25")
+        record_price_observation(
+            share,
+            value,
+            observed_at,
+            PriceObservation.Source.DEMO,
+        )
+        logger.info("Generated explicitly enabled demo price for share %s", share.pk)
+        return float(value), observed_at
+
     try:
         with get_client() as client:
             response = client.market_data.get_last_prices(figi=[share.figi])
@@ -103,6 +163,12 @@ def get_last_data(share):
         )
 
     price = response.last_prices[0]
-    value = price.price.units + price.price.nano / 1_000_000_000
+    value = _quotation_to_decimal(price.price)
+    record_price_observation(
+        share,
+        value,
+        price.time,
+        PriceObservation.Source.TINKOFF,
+    )
     logger.info("Received last price for share %s", share.pk)
-    return value, price.time
+    return float(value), price.time

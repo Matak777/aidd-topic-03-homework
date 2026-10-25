@@ -1,0 +1,87 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}
+    <title>История цен — {{ share.ticker }}</title>
+{% endblock %}
+
+{% block content %}
+    <h1>История цен: {{ share.name }} ({{ share.ticker }})</h1>
+    {% if has_demo_observations %}
+        <p class="alert alert-warning" role="status">
+            В истории есть демонстрационные данные. Синтетические цены не являются реальными котировками.
+        </p>
+    {% elif demo_mode %}
+        <p class="alert alert-warning" role="status">
+            Включён демонстрационный режим. Новые синтетические цены не являются реальными котировками.
+        </p>
+    {% elif not live_available %}
+        <p class="alert alert-warning" role="status">
+            Живые котировки недоступны: настройте TINKOFF_TOKEN и запустите сбор цен.
+        </p>
+    {% endif %}
+
+    <form method="get" class="form-inline mb-3">
+        <label for="period" class="mr-2">Период:</label>
+        <select id="period" name="period" class="form-control mr-2">
+            {% for value, label in periods %}
+                <option value="{{ value }}" {% if history.period == value %}selected{% endif %}>
+                    {{ label }}
+                </option>
+            {% endfor %}
+        </select>
+        <button type="submit" class="btn btn-primary">Показать</button>
+    </form>
+
+    <p>Наблюдений за период: {{ history.observations|length }}</p>
+    {% if history.observations %}
+        {% for series in history.series %}
+            <section class="mb-3">
+                <h2>{{ series.source_label }} — {{ series.currency }}</h2>
+                {% if series.absolute_change is not None %}
+                    <p>Изменение: {{ series.absolute_change }} {{ series.currency }}</p>
+                    {% if series.percentage_change is not None %}
+                        <p>Изменение в процентах: {{ series.percentage_change }}%</p>
+                    {% else %}
+                        <p>Процентное изменение не определено: начальная цена равна нулю.</p>
+                    {% endif %}
+                {% elif series.observations|length == 1 %}
+                    <p>Для этой серии изменение не рассчитывается: требуется не менее двух наблюдений.</p>
+                {% endif %}
+            </section>
+        {% endfor %}
+
+        <div>{{ graph|safe }}</div>
+
+        <table class="table table-striped">
+            <thead>
+                <tr>
+                    <th>Время котировки</th>
+                    <th>Время получения</th>
+                    <th>Цена</th>
+                    <th>Валюта</th>
+                    <th>Источник</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for observation in history.observations %}
+                    <tr>
+                        <td>{{ observation.observed_at|date:"Y-m-d H:i:s T" }}</td>
+                        <td>{{ observation.received_at|date:"Y-m-d H:i:s T" }}</td>
+                        <td>{{ observation.price }}</td>
+                        <td>{{ observation.currency }}</td>
+                        <td>{{ observation.get_source_display }}</td>
+                    </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    {% else %}
+        <p>За выбранный период сохранённых наблюдений нет.</p>
+        {% if demo_mode %}
+            <p>Запустите процесс сбора, чтобы накопить демонстрационные точки.</p>
+        {% elif live_available %}
+            <p>Запустите процесс сбора цен, чтобы сохранить котировки.</p>
+        {% endif %}
+    {% endif %}
+
+    <a href="{% url 'dashboard:detail' share.pk %}" class="btn btn-secondary">К инструменту</a>
+{% endblock %}

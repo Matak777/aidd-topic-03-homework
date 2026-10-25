@@ -160,6 +160,21 @@ STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 TINKOFF_TOKEN = os.getenv("TINKOFF_TOKEN", "").strip()
+PRICE_DATA_MODE = os.getenv("PRICE_DATA_MODE", "live").strip().lower()
+if PRICE_DATA_MODE not in {"live", "demo"}:
+    raise ImproperlyConfigured("PRICE_DATA_MODE must be either 'live' or 'demo'.")
+try:
+    PRICE_COLLECTION_INTERVAL_SECONDS = int(
+        os.getenv("PRICE_COLLECTION_INTERVAL_SECONDS", "300")
+    )
+except ValueError as error:
+    raise ImproperlyConfigured(
+        "PRICE_COLLECTION_INTERVAL_SECONDS must be a positive integer."
+    ) from error
+if PRICE_COLLECTION_INTERVAL_SECONDS < 1:
+    raise ImproperlyConfigured(
+        "PRICE_COLLECTION_INTERVAL_SECONDS must be a positive integer."
+    )
 try:
     TINKOFF_RPC_TIMEOUT_SECONDS = float(
         os.getenv("TINKOFF_RPC_TIMEOUT_SECONDS", "10")

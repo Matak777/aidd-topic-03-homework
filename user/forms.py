@@ -47,8 +47,10 @@ class RegistrationForm(forms.Form):
         if password1 and password2 and password1 != password2:
             self.add_error("password2", "Введенные пароли не совпадают")
         elif password1:
+            email = cleaned_data.get("email")
+            candidate = User(username=email, email=email) if email else None
             try:
-                validate_password(password1)
+                validate_password(password1, user=candidate)
             except ValidationError as error:
                 self.add_error("password1", error)
 

@@ -29,15 +29,33 @@
 
             {% for share in share_list %}
                 <tr>
-                    <td><a href="{% url 'dashboard:detail' share.id %}"> {{share.ticker}} </a></td>
+                    <td>
+                        <a href="{% url 'dashboard:detail' share.id %}">{{ share.ticker }}</a>
+                        <br>
+                        <a href="{% url 'dashboard:history' share.pk %}">История цен</a>
+                    </td>
                     <td>{{share.name}}</td>
                     <td>{{share.isin}}</td>
-                    {%  if  share.is_trend_high %}
+                    {% if share.last_price_source == "tinkoff" and share.is_trend_high %}
                         <td style="background-color: mediumseagreen">
-                            {%  else  %}
+                    {% elif share.last_price_source == "tinkoff" and share.is_trend_high is False %}
                         <td style="background-color: palevioletred">
+                    {% else %}
+                        <td>
                     {% endif %}
-                    {{share.last_price}} {{ share.currency }}</td>
+                    {% if share.last_price is not None %}
+                        {{ share.last_price }} {{ share.currency }}
+                        {% if share.last_price_source == "tinkoff" %}
+                            <small>Live Tinkoff: {{ share.last_price_observed_at|date:"Y-m-d H:i:s T" }}</small>
+                        {% elif share.last_price_source == "manual" %}
+                            <small>Введено вручную, не подтверждено как котировка</small>
+                        {% else %}
+                            <small>Источник цены не подтверждён</small>
+                        {% endif %}
+                    {% else %}
+                        Нет подтверждённой живой цены
+                    {% endif %}
+                    </td>
                     {% if user.is_authenticated %}
                         <td>
                             <a href="{% url 'dashboard:update' share.id %}" class="btn btn-secondary">
