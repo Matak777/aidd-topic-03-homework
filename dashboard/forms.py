@@ -1,13 +1,20 @@
+from uuid import uuid4
+from decimal import Decimal
+
 from django import forms
 from django.core.exceptions import ValidationError
+from django.utils import timezone
 
 from .models import (
     PriceObservation,
+    PortfolioTransaction,
     Share,
     Watchlist,
     WatchlistItem,
     WatchRule,
+    VirtualPortfolio,
 )
+from .services.portfolios import validate_input_amount
 
 
 class ShareModelForm(forms.ModelForm):
@@ -147,3 +154,115 @@ class WatchRuleForm(forms.ModelForm):
             if duplicate.exists():
                 raise ValidationError("Такое правило уже есть в этом списке.")
         return cleaned_data
+
+
+class VirtualPortfolioForm(forms.ModelForm):
+    class Meta:
+        model = VirtualPortfolio
+        fields = ("name", "currency", "valuation_source", "starting_cash")
+        widgets = {
+            "starting_cash": forms.NumberInput(attrs={"step": "0.000000001"}),
+        }
+
+    def __init__(self, *args, owner, **kwargs):
+        self.owner = owner
+        super().__init__(*args, **kwargs)
+
+    def clean_name(self):
+        name = self.cleaned_data["name"].strip()
+        if VirtualPortfolio.objects.filter(owner=self.owner, name=name).exists():
+            raise ValidationError("Портфель с таким названием уже существует.")
+        return name
+
+    def clean_currency(self):
+        currency = self.cleaned_data["currency"].strip()
+        if not currency.isalpha() or not 3 <= len(currency) <= 20:
+            raise ValidationError("Укажите код валюты буквами (например, USD).")
+        return currency.upper()
+
+    def clean_starting_cash(self):
+        cash = validate_input_amount(self.cleaned_data["starting_cash"])
+        if cash <= 0:
+            raise ValidationError("Стартовый виртуальный баланс должен быть больше нуля.")
+        return cash
+
+    def save(self, commit=True):
+        portfolio = super().save(commit=False)
+        portfolio.owner = self.owner
+        portfolio.cash_balance = self.cleaned_data["starting_cash"]
+        if commit:
+            portfolio.save()
+        return portfolio
+
+
+class PortfolioTransactionForm(forms.Form):
+    share = forms.ModelChoiceField(queryset=Share.objects.none(), label="Инструмент")
+    side = forms.ChoiceField(
+        choices=PortfolioTransaction.Side.choices,
+        label="Тип виртуальной операции",
+    )
+    quantity = forms.DecimalField(
+        max_digits=30,
+        decimal_places=9,
+        min_value=Decimal("0.000000001"),
+        label="Количество",
+        widget=forms.NumberInput(attrs={"step": "0.000000001"}),
+    )
+    execution_price = forms.DecimalField(
+        max_digits=30,
+        decimal_places=9,
+        min_value=Decimal("0.000000001"),
+        label="Ручная цена виртуальной сделки",
+        widget=forms.NumberInput(attrs={"step": "0.000000001"}),
+    )
+    commission = forms.DecimalField(
+        max_digits=30,
+        decimal_places=9,
+        min_value=Decimal("0"),
+        initial=Decimal("0"),
+        label="Комиссия",
+        widget=forms.NumberInput(attrs={"step": "0.000000001"}),
+    )
+    currency = forms.CharField(max_length=20, label="Валюта операции")
+    executed_at = forms.DateTimeField(
+        label="Время операции",
+        widget=forms.DateTimeInput(
+            attrs={"type": "datetime-local"},
+            format="%Y-%m-%dT%H:%M",
+        ),
+        input_formats=("%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M:%S"),
+    )
+    idempotency_key = forms.UUIDField(widget=forms.HiddenInput)
+
+    def __init__(self, *args, portfolio, **kwargs):
+        self.portfolio = portfolio
+        kwargs.setdefault(
+            "initial",
+            {
+                "currency": portfolio.currency,
+                "executed_at": timezone.localtime(),
+                "idempotency_key": uuid4(),
+            },
+        )
+        super().__init__(*args, **kwargs)
+        self.fields["share"].queryset = Share.objects.order_by("ticker")
+        self.fields["currency"].initial = portfolio.currency
+        self.fields["currency"].widget.attrs["readonly"] = True
+
+    def clean_currency(self):
+        currency = self.cleaned_data["currency"].strip().upper()
+        if currency.casefold() != self.portfolio.currency.casefold():
+            raise ValidationError(
+                f"Валюта операции должна совпадать с валютой портфеля "
+                f"({self.portfolio.currency})."
+            )
+        return currency
+
+    def clean_quantity(self):
+        return validate_input_amount(self.cleaned_data["quantity"])
+
+    def clean_execution_price(self):
+        return validate_input_amount(self.cleaned_data["execution_price"])
+
+    def clean_commission(self):
+        return validate_input_amount(self.cleaned_data["commission"])

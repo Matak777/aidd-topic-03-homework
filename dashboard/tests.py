@@ -4,6 +4,7 @@ from io import StringIO
 from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
@@ -17,13 +18,16 @@ from rest_framework.test import APIClient, APITestCase
 from dashboard.models import (
     PriceAlert,
     PriceObservation,
+    PortfolioTransaction,
     Share,
     Watchlist,
     WatchlistItem,
     WatchRule,
+    VirtualPortfolio,
 )
 from dashboard.services.market_data import MarketDataError, get_last_data
 from dashboard.services.price_history import get_price_history
+from dashboard.services.portfolios import execute_portfolio_transaction
 
 User = get_user_model()
 
@@ -1413,6 +1417,61 @@ class MarketDataIntegrationTests(TestCase):
         self.assertEqual(observation.share_id, existing.pk)
         self.assertEqual(observation.currency, "usd")
         self.assertEqual(observation.price, Decimal("100"))
+
+    @override_settings(TINKOFF_TOKEN="test-token")
+    def test_catalog_cannot_replace_identity_with_open_portfolio_position(self):
+        existing = make_share()
+        owner = User.objects.create_user(
+            username="catalog-portfolio@example.com",
+            email="catalog-portfolio@example.com",
+            password="test-password-for-local-suite",
+        )
+        portfolio = VirtualPortfolio.objects.create(
+            owner=owner,
+            name="Catalog protection",
+            currency="USD",
+            valuation_source=PriceObservation.Source.DEMO,
+            starting_cash=Decimal("1000"),
+            cash_balance=Decimal("1000"),
+        )
+        execute_portfolio_transaction(
+            portfolio_id=portfolio.pk,
+            share_id=existing.pk,
+            side=PortfolioTransaction.Side.BUY,
+            quantity=Decimal("1"),
+            execution_price=Decimal("100"),
+            commission=Decimal("0"),
+            currency="USD",
+            executed_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            idempotency_key=uuid4(),
+        )
+        remote_share = SimpleNamespace(
+            figi=existing.figi,
+            isin=existing.isin,
+            name="Replacement instrument",
+            ticker="REPL",
+            currency="usd",
+            uid="REPLACEMENT-UID",
+        )
+        client_context = MagicMock()
+        client = client_context.__enter__.return_value
+        client.instruments.shares.return_value.instruments = [remote_share]
+
+        with patch(
+            "dashboard.management.commands.add_shares.get_client",
+            return_value=client_context,
+        ):
+            with self.assertRaisesMessage(CommandError, "сохранённой историей"):
+                call_command("add_shares")
+
+        existing.refresh_from_db()
+        position = portfolio.positions.get()
+        transaction_record = portfolio.transactions.get()
+        self.assertEqual(existing.figi, "BBG000B9XRY4")
+        self.assertEqual(existing.uid, "a9eb4238-eba9-488c-b102-b6140fd08e38")
+        self.assertEqual(position.quantity, Decimal("1.000000000"))
+        self.assertEqual(transaction_record.share_ticker, "AAPL")
+        self.assertFalse(existing.price_observations.exists())
 
     @override_settings(TINKOFF_TOKEN="test-token")
     def test_graph_is_built_from_mocked_daily_candles(self):

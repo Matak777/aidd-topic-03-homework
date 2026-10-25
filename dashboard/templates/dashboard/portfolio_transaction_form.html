@@ -1,0 +1,15 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}<title>Новая виртуальная операция</title>{% endblock %}
+
+{% block content %}
+<p><a href="{% url 'dashboard:portfolio-detail' portfolio.pk %}">К портфелю {{ portfolio.name }}</a></p>
+<h1>Новая виртуальная операция</h1>
+<p>Симуляция без отправки брокерского ордера. Цена вводится вручную только для этой сделки и не изменяет рыночные котировки или историю.</p>
+<p>Доступно виртуальных средств: {{ portfolio.cash_balance }} {{ portfolio.currency }}. Валюта операции должна совпадать с валютой портфеля ({{ portfolio.currency }}).</p>
+<form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button class="btn btn-primary" type="submit">Провести виртуальную операцию</button>
+</form>
+{% endblock %}

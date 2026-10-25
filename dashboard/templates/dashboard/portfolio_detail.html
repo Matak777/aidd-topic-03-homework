@@ -1,0 +1,77 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}<title>{{ portfolio.name }}</title>{% endblock %}
+
+{% block content %}
+<p><a href="{% url 'dashboard:portfolios' %}">К портфелям</a></p>
+<h1>{{ portfolio.name }}</h1>
+<p>
+    Валюта: {{ portfolio.currency }}.
+    Источник оценки: {{ portfolio.get_valuation_source_display }}.
+    {% if portfolio.valuation_source == "demo" %}<strong>ДЕМО: синтетические цены, не рыночные котировки.</strong>{% endif %}
+</p>
+<dl>
+    <dt>Стартовый виртуальный капитал</dt>
+    <dd>{{ portfolio.starting_cash }} {{ portfolio.currency }}</dd>
+    <dt>Денежный остаток</dt>
+    <dd>{{ portfolio.cash_balance }} {{ portfolio.currency }}</dd>
+    <dt>Реализованный результат</dt>
+    <dd>{{ valuation.realized_pnl }} {{ portfolio.currency }}</dd>
+    <dt>Нереализованный результат</dt>
+    <dd>{% if valuation.unrealized_pnl is None %}Неизвестен: отсутствует оценка открытой позиции{% else %}{{ valuation.unrealized_pnl }} {{ portfolio.currency }}{% endif %}</dd>
+    <dt>Полная оценка портфеля на {{ valuation.valued_at }}</dt>
+    <dd>{% if valuation.total_value is None %}Неполная: как минимум по одной открытой позиции нет подходящей котировки{% else %}{{ valuation.total_value }} {{ portfolio.currency }}{% endif %}</dd>
+    <dt>Совокупный результат / доходность</dt>
+    <dd>{% if valuation.total_result is None %}Неизвестны до появления всех необходимых котировок{% else %}{{ valuation.total_result }} {{ portfolio.currency }} ({{ valuation.return_percentage }}%){% endif %}</dd>
+</dl>
+
+<h2>Позиции</h2>
+<table class="table">
+    <thead><tr>
+        <th>Инструмент</th><th>Количество</th><th>Средняя себестоимость</th>
+        <th>Последняя цена оценки</th><th>Стоимость</th><th>Реализовано</th><th>Нереализовано</th>
+    </tr></thead>
+    <tbody>
+    {% for item in valuation.positions %}
+        <tr>
+            <td>{{ item.position.share_ticker }} — {{ item.position.share_name }}</td>
+            <td>{{ item.position.quantity }}</td>
+            <td>{{ item.position.average_cost }} {{ portfolio.currency }}</td>
+            <td>
+                {% if item.position.quantity == 0 %}Позиция закрыта
+                {% elif item.market_price is None %}Нет котировки {{ portfolio.get_valuation_source_display }} / {{ portfolio.currency }}
+                {% else %}{{ item.market_price }} {{ portfolio.currency }} · {{ item.price_source_label }} · {{ item.market_observed_at }}{% endif %}
+            </td>
+            <td>{% if item.market_value is None %}Неизвестна{% else %}{{ item.market_value }} {{ portfolio.currency }}{% endif %}</td>
+            <td>{{ item.position.realized_pnl }} {{ portfolio.currency }}</td>
+            <td>{% if item.unrealized_pnl is None %}Неизвестна{% else %}{{ item.unrealized_pnl }} {{ portfolio.currency }}{% endif %}</td>
+        </tr>
+    {% empty %}
+        <tr><td colspan="7">Открытых и закрытых позиций пока нет.</td></tr>
+    {% endfor %}
+    </tbody>
+</table>
+
+<p><a class="btn btn-primary" href="{% url 'dashboard:portfolio-transaction-create' portfolio.pk %}">Добавить виртуальную операцию</a></p>
+
+<h2>История виртуальных операций</h2>
+<p>Записи неизменяемы; операции одного времени упорядочены стабильным идентификатором.</p>
+<table class="table">
+    <thead><tr><th>Время</th><th>Инструмент</th><th>Сторона</th><th>Количество</th><th>Цена исполнения</th><th>Комиссия</th><th>Валюта</th></tr></thead>
+    <tbody>
+    {% for operation in transactions %}
+        <tr>
+            <td>{{ operation.executed_at }}</td>
+            <td>{{ operation.share_ticker }} — {{ operation.share_name }}</td>
+            <td>{{ operation.get_side_display }}</td>
+            <td>{{ operation.quantity }}</td>
+            <td>{{ operation.execution_price }} <small>(ручная цена виртуальной сделки)</small></td>
+            <td>{{ operation.commission }}</td>
+            <td>{{ operation.currency }}</td>
+        </tr>
+    {% empty %}
+        <tr><td colspan="7">Операций пока нет.</td></tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

@@ -1,5 +1,6 @@
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.auth.decorators import login_required
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.http import HttpResponseBadRequest
 from django.shortcuts import redirect
@@ -11,9 +12,11 @@ from django.views.generic import CreateView, DeleteView, DetailView, ListView, U
 
 from .forms import (
     ShareModelForm,
+    PortfolioTransactionForm,
     WatchlistForm,
     WatchlistItemForm,
     WatchRuleForm,
+    VirtualPortfolioForm,
 )
 from .models import (
     PriceAlert,
@@ -22,8 +25,10 @@ from .models import (
     Watchlist,
     WatchlistItem,
     WatchRule,
+    VirtualPortfolio,
 )
 from .services.price_alerts import initialize_new_rule_state, reset_rule_state
+from .services.portfolios import execute_portfolio_transaction, value_portfolio
 from .services.graph import get_graph
 from .services.market_data import MarketDataError
 from .services.price_history import (
@@ -264,6 +269,81 @@ def price_alert_mark_read(request, pk):
     alert.is_read = True
     alert.save(update_fields=("is_read",))
     return redirect("dashboard:price-alerts")
+
+
+@login_required
+def portfolio_index(request):
+    form = VirtualPortfolioForm(
+        request.POST if request.method == "POST" else None,
+        owner=request.user,
+    )
+    if request.method == "POST" and form.is_valid():
+        portfolio = form.save()
+        return redirect("dashboard:portfolio-detail", pk=portfolio.pk)
+    return render(
+        request,
+        "dashboard/portfolio_index.html",
+        {
+            "form": form,
+            "portfolios": VirtualPortfolio.objects.filter(owner=request.user),
+        },
+        status=400 if request.method == "POST" and form.errors else 200,
+    )
+
+
+@login_required
+def portfolio_detail(request, pk):
+    portfolio = get_object_or_404(
+        VirtualPortfolio,
+        pk=pk,
+        owner=request.user,
+    )
+    return render(
+        request,
+        "dashboard/portfolio_detail.html",
+        {
+            "portfolio": portfolio,
+            "valuation": value_portfolio(portfolio),
+            "transactions": portfolio.transactions.select_related("share"),
+        },
+    )
+
+
+@login_required
+def portfolio_transaction_create(request, pk):
+    portfolio = get_object_or_404(
+        VirtualPortfolio,
+        pk=pk,
+        owner=request.user,
+    )
+    form = PortfolioTransactionForm(
+        request.POST if request.method == "POST" else None,
+        portfolio=portfolio,
+    )
+    if request.method == "POST" and form.is_valid():
+        try:
+            record, _created = execute_portfolio_transaction(
+                portfolio_id=portfolio.pk,
+                share_id=form.cleaned_data["share"].pk,
+                side=form.cleaned_data["side"],
+                quantity=form.cleaned_data["quantity"],
+                execution_price=form.cleaned_data["execution_price"],
+                commission=form.cleaned_data["commission"],
+                currency=form.cleaned_data["currency"],
+                executed_at=form.cleaned_data["executed_at"],
+                idempotency_key=form.cleaned_data["idempotency_key"],
+            )
+        except ValidationError as error:
+            form.add_error(None, error)
+        else:
+            return redirect("dashboard:portfolio-detail", pk=record.portfolio_id)
+
+    return render(
+        request,
+        "dashboard/portfolio_transaction_form.html",
+        {"portfolio": portfolio, "form": form},
+        status=400 if request.method == "POST" and form.errors else 200,
+    )
 
 
 class ShareCreateView(LoginRequiredMixin, CreateView):

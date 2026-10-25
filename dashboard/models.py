@@ -42,9 +42,17 @@ class Share(models.Model):
             getattr(self, field) != getattr(previous, field)
             for field in self.IDENTITY_FIELDS
         )
-        currency_changed = self.currency != previous.currency
+        currency_changed = (
+            self.currency.casefold() != previous.currency.casefold()
+        )
 
-        if identity_changed and self.pk and self.price_observations.exists():
+        has_portfolio_history = self.pk and (
+            self.portfolio_positions.exists()
+            or self.portfolio_transactions.exists()
+        )
+        has_price_history = self.pk and self.price_observations.exists()
+
+        if identity_changed and (has_price_history or has_portfolio_history):
             changed = [
                 field
                 for field in self.IDENTITY_FIELDS
@@ -54,9 +62,20 @@ class Share(models.Model):
                 {
                     field: (
                         "Нельзя менять идентификатор инструмента, пока у него "
-                        "сохранена история цен. Создайте новый инструмент."
+                        "сохранена история цен или виртуальных операций. "
+                        "Создайте новый инструмент."
                     )
                     for field in changed
+                }
+            )
+
+        if currency_changed and has_portfolio_history:
+            raise ValidationError(
+                {
+                    "currency": (
+                        "Нельзя менять валюту инструмента, связанного с "
+                        "виртуальной позицией или журналом операций."
+                    )
                 }
             )
 
@@ -257,3 +276,144 @@ class PriceAlert(models.Model):
 
     def __str__(self):
         return f"{self.share_ticker}: {self.price} {self.currency}"
+
+
+class VirtualPortfolio(models.Model):
+    class ValuationSource(models.TextChoices):
+        DEMO = PriceObservation.Source.DEMO, "Демонстрационные данные"
+        TINKOFF = PriceObservation.Source.TINKOFF, "Tinkoff Invest"
+
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="virtual_portfolios",
+    )
+    name = models.CharField(max_length=100)
+    currency = models.CharField(max_length=20)
+    valuation_source = models.CharField(
+        max_length=20,
+        choices=ValuationSource.choices,
+    )
+    starting_cash = models.DecimalField(max_digits=30, decimal_places=9)
+    cash_balance = models.DecimalField(max_digits=30, decimal_places=9)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("name", "pk")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("owner", "name"),
+                name="unique_virtual_portfolio_name_per_owner",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(starting_cash__gt=0),
+                name="portfolio_starting_cash_positive",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(cash_balance__gte=0),
+                name="portfolio_cash_nonnegative",
+            ),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class PortfolioPosition(models.Model):
+    portfolio = models.ForeignKey(
+        VirtualPortfolio,
+        on_delete=models.CASCADE,
+        related_name="positions",
+    )
+    share = models.ForeignKey(
+        Share,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="portfolio_positions",
+    )
+    share_ticker = models.CharField(max_length=10)
+    share_name = models.CharField(max_length=255)
+    quantity = models.DecimalField(max_digits=30, decimal_places=9, default=0)
+    cost_basis = models.DecimalField(max_digits=30, decimal_places=9, default=0)
+    average_cost = models.DecimalField(max_digits=30, decimal_places=9, default=0)
+    realized_pnl = models.DecimalField(max_digits=30, decimal_places=9, default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("share_ticker", "pk")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("portfolio", "share"),
+                name="unique_position_per_portfolio_share",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(quantity__gte=0),
+                name="portfolio_position_quantity_nonnegative",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(cost_basis__gte=0),
+                name="portfolio_position_cost_basis_nonnegative",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.portfolio.name}: {self.share_ticker}"
+
+
+class PortfolioTransaction(models.Model):
+    class Side(models.TextChoices):
+        BUY = "buy", "Покупка (BUY)"
+        SELL = "sell", "Продажа (SELL)"
+
+    portfolio = models.ForeignKey(
+        VirtualPortfolio,
+        on_delete=models.CASCADE,
+        related_name="transactions",
+    )
+    share = models.ForeignKey(
+        Share,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="portfolio_transactions",
+    )
+    share_ticker = models.CharField(max_length=10)
+    share_name = models.CharField(max_length=255)
+    side = models.CharField(max_length=4, choices=Side.choices)
+    quantity = models.DecimalField(max_digits=30, decimal_places=9)
+    execution_price = models.DecimalField(max_digits=30, decimal_places=9)
+    commission = models.DecimalField(max_digits=30, decimal_places=9, default=0)
+    currency = models.CharField(max_length=20)
+    executed_at = models.DateTimeField()
+    idempotency_key = models.UUIDField(unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("executed_at", "pk")
+        indexes = [
+            models.Index(
+                fields=("portfolio", "executed_at", "id"),
+                name="portfolio_tx_order_idx",
+            )
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(quantity__gt=0),
+                name="portfolio_tx_quantity_positive",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(execution_price__gt=0),
+                name="portfolio_tx_price_positive",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(commission__gte=0),
+                name="portfolio_tx_commission_nonnegative",
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.get_side_display()} {self.quantity} {self.share_ticker} "
+            f"@ {self.execution_price} {self.currency}"
+        )

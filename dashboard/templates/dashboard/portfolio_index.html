@@ -1,0 +1,26 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}<title>Виртуальные портфели</title>{% endblock %}
+
+{% block content %}
+<h1>Виртуальные портфели</h1>
+<p>Все операции — симуляция. Ордеры брокеру не отправляются.</p>
+<ul>
+    {% for portfolio in portfolios %}
+        <li>
+            <a href="{% url 'dashboard:portfolio-detail' portfolio.pk %}">{{ portfolio.name }}</a>
+            — {{ portfolio.currency }} · виртуальный баланс {{ portfolio.cash_balance }}
+            {% if portfolio.valuation_source == "demo" %}<strong>ДЕМО-оценка</strong>{% endif %}
+        </li>
+    {% empty %}
+        <li>Портфелей пока нет.</li>
+    {% endfor %}
+</ul>
+
+<h2>Создать портфель</h2>
+<form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button class="btn btn-primary" type="submit">Создать виртуальный портфель</button>
+</form>
+{% endblock %}

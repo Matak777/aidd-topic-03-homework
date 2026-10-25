@@ -8,6 +8,9 @@ from dashboard.views import (
     ShareUpdateView,
     price_alert_list,
     price_alert_mark_read,
+    portfolio_detail,
+    portfolio_index,
+    portfolio_transaction_create,
     share_price_history,
     watch_rule_delete,
     watch_rule_edit,
@@ -42,5 +45,12 @@ urlpatterns = [
     path("watch-rules/<int:pk>/delete/", watch_rule_delete, name="watch-rule-delete"),
     path("alerts/", price_alert_list, name="price-alerts"),
     path("alerts/<int:pk>/read/", price_alert_mark_read, name="price-alert-read"),
+    path("portfolios/", portfolio_index, name="portfolios"),
+    path("portfolios/<int:pk>/", portfolio_detail, name="portfolio-detail"),
+    path(
+        "portfolios/<int:pk>/transactions/new/",
+        portfolio_transaction_create,
+        name="portfolio-transaction-create",
+    ),
     path("api/", include("dashboard.api.urls")),
 ]
