@@ -33,7 +33,7 @@
     </tr></thead>
     <tbody>
     {% for item in valuation.positions %}
-        <tr>
+        <tr id="position-{{ item.position.pk }}">
             <td>{{ item.position.share_ticker }} — {{ item.position.share_name }}</td>
             <td>{{ item.position.quantity }}</td>
             <td>{{ item.position.average_cost }} {{ portfolio.currency }}</td>
@@ -60,12 +60,20 @@
     <thead><tr><th>Время</th><th>Инструмент</th><th>Сторона</th><th>Количество</th><th>Цена исполнения</th><th>Комиссия</th><th>Валюта</th></tr></thead>
     <tbody>
     {% for operation in transactions %}
-        <tr>
+        <tr id="transaction-{{ operation.pk }}">
             <td>{{ operation.executed_at }}</td>
             <td>{{ operation.share_ticker }} — {{ operation.share_name }}</td>
             <td>{{ operation.get_side_display }}</td>
             <td>{{ operation.quantity }}</td>
-            <td>{{ operation.execution_price }} <small>(ручная цена виртуальной сделки)</small></td>
+            <td>
+                {{ operation.execution_price }}
+                {% if operation.execution_type == "strategy" %}
+                    <small>({{ operation.strategy_name }} · котировка {{ operation.quote_source }} {{ operation.quote_currency }} от {{ operation.quote_observed_at }})</small>
+                    {% if operation.quote_source == "demo" %}<strong>ДЕМО</strong>{% endif %}
+                {% else %}
+                    <small>(ручная цена виртуальной сделки)</small>
+                {% endif %}
+            </td>
             <td>{{ operation.commission }}</td>
             <td>{{ operation.currency }}</td>
         </tr>
@@ -74,4 +82,20 @@
     {% endfor %}
     </tbody>
 </table>
+
+<h2>Журнал автоматических стратегий</h2>
+<p>Общая оценка портфеля включает ручные операции и все его стратегии; это не изолированный результат одной стратегии.</p>
+<ul>
+    {% for evaluation in strategy_evaluations %}
+        <li>
+            {{ evaluation.processed_at }} · {{ evaluation.strategy_name }} ·
+            {{ evaluation.share_ticker }} · {{ evaluation.observed_price }} {{ evaluation.observed_currency }} ·
+            {{ evaluation.get_decision_display }}{% if evaluation.reason %}: {{ evaluation.reason }}{% endif %}
+            {% if evaluation.observed_source == "demo" %}<strong>ДЕМО</strong>{% endif %}
+            {% if evaluation.transaction_id %} · <a href="#transaction-{{ evaluation.transaction_id }}">Операция #{{ evaluation.transaction_id }}</a>{% endif %}
+        </li>
+    {% empty %}
+        <li>Оценок стратегий пока нет.</li>
+    {% endfor %}
+</ul>
 {% endblock %}

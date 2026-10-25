@@ -1,0 +1,57 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}<title>{{ strategy.name }}</title>{% endblock %}
+
+{% block content %}
+<p><a href="{% url 'dashboard:strategies' %}">К моим стратегиям</a></p>
+<h1>{{ strategy.name }}</h1>
+<p>
+    {{ strategy.share_ticker }} — {{ strategy.share_name }}:
+    {{ strategy.get_direction_display }} {{ strategy.threshold }} {{ strategy.currency }};
+    {{ strategy.get_action_display }} {{ strategy.quantity }}, комиссия {{ strategy.commission }}.
+    Портфель: <a href="{% url 'dashboard:portfolio-detail' strategy.portfolio_id %}">{{ strategy.portfolio.name }}</a>.
+    Источник {{ strategy.get_source_display }}.
+    {% if strategy.source == "demo" %}<strong>ДЕМО: синтетические котировки.</strong>{% endif %}
+</p>
+<p>Состояние: {% if strategy.enabled %}включена{% else %}приостановлена{% endif %};
+    {% if strategy.armed %}ожидает входа в условие{% else %}срабатывание израсходовано, ожидается выход из условия{% endif %}.</p>
+<p>Оценка связанного портфеля: cash {{ strategy.portfolio.cash_balance }} {{ strategy.portfolio.currency }};
+    {% if valuation.total_value is None %}полная стоимость и доходность неизвестны: отсутствует подходящая котировка{% else %}
+    стоимость {{ valuation.total_value }} {{ strategy.portfolio.currency }},
+    результат {{ valuation.total_result }} {{ strategy.portfolio.currency }},
+    доходность {{ valuation.return_percentage }}%{% endif %}.</p>
+<p><strong>Эти итоги включают ручные операции и другие стратегии портфеля; они не являются изолированной доходностью данной стратегии.</strong></p>
+
+<div>
+    <a class="btn btn-secondary" href="{% url 'dashboard:strategy-edit' strategy.pk %}">Изменить</a>
+    <form method="post" action="{% url 'dashboard:strategy-toggle' strategy.pk %}" style="display:inline">
+        {% csrf_token %}
+        <button class="btn btn-warning" type="submit">{% if strategy.enabled %}Приостановить{% else %}Включить{% endif %}</button>
+    </form>
+    <form method="post" action="{% url 'dashboard:strategy-delete' strategy.pk %}" style="display:inline">
+        {% csrf_token %}
+        <button class="btn btn-danger" type="submit">Удалить стратегию</button>
+    </form>
+</div>
+
+<h2>Оценки и попытки</h2>
+<p>Каждая оценка сохраняет снимок условия, котировки, решение и причину; DEMO не является рыночной ценой.</p>
+<table class="table">
+    <thead><tr><th>Обработано</th><th>Котировка</th><th>Условие</th><th>Решение</th><th>Причина / операция</th></tr></thead>
+    <tbody>
+    {% for evaluation in evaluations %}
+        <tr>
+            <td>{{ evaluation.processed_at }}</td>
+            <td>{{ evaluation.observed_price }} {{ evaluation.observed_currency }} · {{ evaluation.observed_at }} · {{ evaluation.get_observed_source_display|default:evaluation.observed_source }}{% if evaluation.observed_source == "demo" %} · ДЕМО{% endif %}</td>
+            <td>{{ evaluation.get_direction_display }} {{ evaluation.threshold }}</td>
+            <td>{{ evaluation.get_decision_display }}</td>
+            <td>{% if evaluation.reason %}{{ evaluation.reason }}{% endif %}
+                {% if evaluation.transaction_id %} <a href="{% url 'dashboard:portfolio-detail' evaluation.transaction.portfolio_id %}#transaction-{{ evaluation.transaction_id }}">Операция #{{ evaluation.transaction_id }}</a>{% endif %}
+            </td>
+        </tr>
+    {% empty %}
+        <tr><td colspan="5">Наблюдения после создания стратегии пока не обрабатывались.</td></tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

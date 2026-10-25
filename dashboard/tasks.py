@@ -48,4 +48,7 @@ def _update_last_price(share_id=None, *, stop_event=None):
     from dashboard.services.price_alerts import process_price_alerts
 
     process_price_alerts(share_id=share_id)
+    from dashboard.services.virtual_strategies import process_virtual_strategies
+
+    process_virtual_strategies(share_id=share_id)
     return updated

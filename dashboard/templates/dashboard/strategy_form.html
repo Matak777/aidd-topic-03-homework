@@ -1,0 +1,14 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}<title>{% if strategy %}Изменить стратегию{% else %}Новая стратегия{% endif %}</title>{% endblock %}
+
+{% block content %}
+<p><a href="{% url 'dashboard:strategies' %}">К моим стратегиям</a></p>
+<h1>{% if strategy %}Изменить стратегию {{ strategy.name }}{% else %}Создать стратегию{% endif %}</h1>
+<p>Сохранение изменённых параметров устанавливает текущую котировку исходной точкой: историю назад не проигрываем.</p>
+<form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button class="btn btn-primary" type="submit">Сохранить</button>
+</form>
+{% endblock %}

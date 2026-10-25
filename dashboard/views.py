@@ -13,6 +13,7 @@ from django.views.generic import CreateView, DeleteView, DetailView, ListView, U
 from .forms import (
     ShareModelForm,
     PortfolioTransactionForm,
+    TradingStrategyForm,
     WatchlistForm,
     WatchlistItemForm,
     WatchRuleForm,
@@ -25,6 +26,7 @@ from .models import (
     Watchlist,
     WatchlistItem,
     WatchRule,
+    TradingStrategy,
     VirtualPortfolio,
 )
 from .services.price_alerts import initialize_new_rule_state, reset_rule_state
@@ -36,6 +38,7 @@ from .services.price_history import (
     build_price_history_graph,
     get_price_history,
 )
+from .services.virtual_strategies import initialize_strategy
 
 
 class ShareListView(ListView):
@@ -292,6 +295,110 @@ def portfolio_index(request):
 
 
 @login_required
+def strategy_index(request):
+    form = TradingStrategyForm(
+        request.POST if request.method == "POST" else None,
+        owner=request.user,
+    )
+    if request.method == "POST" and form.is_valid():
+        strategy = form.save()
+        initialize_strategy(strategy, new_strategy=True)
+        return redirect("dashboard:strategy-detail", pk=strategy.pk)
+    return render(
+        request,
+        "dashboard/strategy_index.html",
+        {
+            "form": form,
+            "strategies": TradingStrategy.objects.filter(
+                owner=request.user,
+                portfolio__owner=request.user,
+            )
+            .select_related("portfolio", "share")
+            .order_by("created_at", "pk"),
+            "max_age_seconds": settings.STRATEGY_MAX_OBSERVATION_AGE_SECONDS,
+        },
+        status=400 if request.method == "POST" and form.errors else 200,
+    )
+
+
+@login_required
+def strategy_detail(request, pk):
+    strategy = get_object_or_404(
+        TradingStrategy.objects.select_related("portfolio", "share"),
+        pk=pk,
+        owner=request.user,
+        portfolio__owner=request.user,
+    )
+    evaluations = strategy.evaluations.select_related("transaction", "observation")
+    return render(
+        request,
+        "dashboard/strategy_detail.html",
+        {
+            "strategy": strategy,
+            "evaluations": evaluations,
+            "valuation": value_portfolio(strategy.portfolio),
+            "transactions": strategy.transactions.select_related(
+                "execution_observation"
+            ),
+        },
+    )
+
+
+@login_required
+def strategy_edit(request, pk):
+    strategy = get_object_or_404(
+        TradingStrategy,
+        pk=pk,
+        owner=request.user,
+        portfolio__owner=request.user,
+    )
+    form = TradingStrategyForm(
+        request.POST if request.method == "POST" else None,
+        instance=strategy,
+        owner=request.user,
+    )
+    if request.method == "POST" and form.is_valid():
+        strategy = form.save()
+        initialize_strategy(strategy, new_strategy=False)
+        return redirect("dashboard:strategy-detail", pk=strategy.pk)
+    return render(
+        request,
+        "dashboard/strategy_form.html",
+        {"form": form, "strategy": strategy},
+        status=400 if request.method == "POST" and form.errors else 200,
+    )
+
+
+@login_required
+@require_POST
+def strategy_toggle(request, pk):
+    strategy = get_object_or_404(
+        TradingStrategy,
+        pk=pk,
+        owner=request.user,
+        portfolio__owner=request.user,
+    )
+    strategy.enabled = not strategy.enabled
+    strategy.save(update_fields=("enabled", "updated_at"))
+    if strategy.enabled:
+        initialize_strategy(strategy, new_strategy=False)
+    return redirect("dashboard:strategy-detail", pk=strategy.pk)
+
+
+@login_required
+@require_POST
+def strategy_delete(request, pk):
+    strategy = get_object_or_404(
+        TradingStrategy,
+        pk=pk,
+        owner=request.user,
+        portfolio__owner=request.user,
+    )
+    strategy.delete()
+    return redirect("dashboard:strategies")
+
+
+@login_required
 def portfolio_detail(request, pk):
     portfolio = get_object_or_404(
         VirtualPortfolio,
@@ -305,6 +412,9 @@ def portfolio_detail(request, pk):
             "portfolio": portfolio,
             "valuation": value_portfolio(portfolio),
             "transactions": portfolio.transactions.select_related("share"),
+            "strategy_evaluations": portfolio.strategy_evaluations.select_related(
+                "transaction"
+            ),
         },
     )
 

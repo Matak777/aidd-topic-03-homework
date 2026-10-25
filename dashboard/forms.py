@@ -12,6 +12,7 @@ from .models import (
     Watchlist,
     WatchlistItem,
     WatchRule,
+    TradingStrategy,
     VirtualPortfolio,
 )
 from .services.portfolios import validate_input_amount
@@ -266,3 +267,94 @@ class PortfolioTransactionForm(forms.Form):
 
     def clean_commission(self):
         return validate_input_amount(self.cleaned_data["commission"])
+
+
+class TradingStrategyForm(forms.ModelForm):
+    portfolio = forms.ModelChoiceField(
+        queryset=VirtualPortfolio.objects.none(),
+        label="Личный портфель",
+    )
+    share = forms.ModelChoiceField(
+        queryset=Share.objects.order_by("ticker"),
+        label="Инструмент",
+    )
+
+    class Meta:
+        model = TradingStrategy
+        fields = (
+            "name",
+            "portfolio",
+            "share",
+            "source",
+            "currency",
+            "direction",
+            "threshold",
+            "action",
+            "quantity",
+            "commission",
+        )
+        widgets = {
+            "threshold": forms.NumberInput(attrs={"step": "0.000000001"}),
+            "quantity": forms.NumberInput(attrs={"step": "0.000000001"}),
+            "commission": forms.NumberInput(attrs={"step": "0.000000001"}),
+        }
+
+    def __init__(self, *args, owner, **kwargs):
+        self.owner = owner
+        super().__init__(*args, **kwargs)
+        self.fields["portfolio"].queryset = VirtualPortfolio.objects.filter(
+            owner=owner
+        ).order_by("name", "pk")
+
+    def clean_threshold(self):
+        threshold = validate_input_amount(self.cleaned_data["threshold"])
+        if threshold < 0:
+            raise ValidationError("Порог не может быть отрицательным.")
+        return threshold
+
+    def clean_quantity(self):
+        quantity = validate_input_amount(self.cleaned_data["quantity"])
+        if quantity <= 0:
+            raise ValidationError("Количество должно быть положительным.")
+        return quantity
+
+    def clean_commission(self):
+        commission = validate_input_amount(self.cleaned_data["commission"])
+        if commission < 0:
+            raise ValidationError("Комиссия не может быть отрицательной.")
+        return commission
+
+    def clean_currency(self):
+        return self.cleaned_data["currency"].strip().upper()
+
+    def clean(self):
+        cleaned_data = super().clean()
+        portfolio = cleaned_data.get("portfolio")
+        share = cleaned_data.get("share")
+        source = cleaned_data.get("source")
+        currency = cleaned_data.get("currency")
+        if portfolio and source and source != portfolio.valuation_source:
+            self.add_error(
+                "source",
+                "Источник стратегии должен совпадать с источником оценки портфеля.",
+            )
+        if portfolio and currency and currency.casefold() != portfolio.currency.casefold():
+            self.add_error(
+                "currency",
+                "Валюта стратегии должна совпадать с валютой портфеля.",
+            )
+        if share and currency and currency.casefold() != share.currency.casefold():
+            self.add_error(
+                "currency",
+                "Валюта стратегии должна совпадать с валютой инструмента.",
+            )
+        return cleaned_data
+
+    def save(self, commit=True):
+        strategy = super().save(commit=False)
+        strategy.owner = self.owner
+        strategy.share_ticker = strategy.share.ticker
+        strategy.share_name = strategy.share.name
+        if commit:
+            strategy.save()
+        return strategy

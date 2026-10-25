@@ -1,0 +1,32 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}<title>Личные стратегии</title>{% endblock %}
+
+{% block content %}
+<h1>Личные стратегии виртуальных сделок</h1>
+<p>Это текущая симуляция по новым сохранённым котировкам, не исторический бэктест. Брокерские ордера не отправляются.</p>
+<p>Котировка должна быть не старше {{ max_age_seconds }} секунд при обработке. Возраст можно настроить параметром <code>STRATEGY_MAX_OBSERVATION_AGE_SECONDS</code>.</p>
+
+<h2>Мои стратегии</h2>
+<ul>
+    {% for strategy in strategies %}
+        <li>
+            <a href="{% url 'dashboard:strategy-detail' strategy.pk %}">{{ strategy.name }}</a>
+            — {{ strategy.share_ticker }} {{ strategy.get_direction_display }} {{ strategy.threshold }} {{ strategy.currency }},
+            {{ strategy.get_action_display }} {{ strategy.quantity }};
+            портфель {{ strategy.portfolio.name }};
+            {% if strategy.enabled %}включена{% else %}приостановлена{% endif %}
+            {% if strategy.source == "demo" %}<strong>ДЕМО</strong>{% endif %}
+        </li>
+    {% empty %}
+        <li>Стратегий пока нет.</li>
+    {% endfor %}
+</ul>
+
+<h2>Создать стратегию</h2>
+<form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button class="btn btn-primary" type="submit">Создать стратегию</button>
+</form>
+{% endblock %}

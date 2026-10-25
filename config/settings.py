@@ -177,6 +177,18 @@ if PRICE_COLLECTION_INTERVAL_SECONDS < 1:
         "PRICE_COLLECTION_INTERVAL_SECONDS must be a positive integer."
     )
 try:
+    STRATEGY_MAX_OBSERVATION_AGE_SECONDS = int(
+        os.getenv("STRATEGY_MAX_OBSERVATION_AGE_SECONDS", "300")
+    )
+except ValueError as error:
+    raise ImproperlyConfigured(
+        "STRATEGY_MAX_OBSERVATION_AGE_SECONDS must be a positive integer."
+    ) from error
+if STRATEGY_MAX_OBSERVATION_AGE_SECONDS < 1:
+    raise ImproperlyConfigured(
+        "STRATEGY_MAX_OBSERVATION_AGE_SECONDS must be a positive integer."
+    )
+try:
     TINKOFF_RPC_TIMEOUT_SECONDS = float(
         os.getenv("TINKOFF_RPC_TIMEOUT_SECONDS", "10")
     )

@@ -51,8 +51,11 @@ class Share(models.Model):
             or self.portfolio_transactions.exists()
         )
         has_price_history = self.pk and self.price_observations.exists()
+        has_strategy_reference = self.pk and self.trading_strategies.exists()
 
-        if identity_changed and (has_price_history or has_portfolio_history):
+        if identity_changed and (
+            has_price_history or has_portfolio_history or has_strategy_reference
+        ):
             changed = [
                 field
                 for field in self.IDENTITY_FIELDS
@@ -61,20 +64,20 @@ class Share(models.Model):
             raise ValidationError(
                 {
                     field: (
-                        "Нельзя менять идентификатор инструмента, пока у него "
-                        "сохранена история цен или виртуальных операций. "
+                        "Нельзя менять идентификатор инструмента, пока на него "
+                        "ссылается история цен, виртуальный журнал или стратегия. "
                         "Создайте новый инструмент."
                     )
                     for field in changed
                 }
             )
 
-        if currency_changed and has_portfolio_history:
+        if currency_changed and (has_portfolio_history or has_strategy_reference):
             raise ValidationError(
                 {
                     "currency": (
                         "Нельзя менять валюту инструмента, связанного с "
-                        "виртуальной позицией или журналом операций."
+                        "виртуальной позицией, журналом операций или стратегией."
                     )
                 }
             )
@@ -319,6 +322,75 @@ class VirtualPortfolio(models.Model):
         return self.name
 
 
+class TradingStrategy(models.Model):
+    class Direction(models.TextChoices):
+        AT_LEAST = "gte", "Цена не ниже порога (>=)"
+        AT_MOST = "lte", "Цена не выше порога (<=)"
+
+    class Action(models.TextChoices):
+        BUY = "buy", "Виртуальная покупка (BUY)"
+        SELL = "sell", "Виртуальная продажа (SELL)"
+
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="trading_strategies",
+    )
+    portfolio = models.ForeignKey(
+        VirtualPortfolio,
+        on_delete=models.CASCADE,
+        related_name="strategies",
+    )
+    share = models.ForeignKey(
+        Share,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="trading_strategies",
+    )
+    name = models.CharField(max_length=100)
+    share_ticker = models.CharField(max_length=10)
+    share_name = models.CharField(max_length=255)
+    source = models.CharField(
+        max_length=20,
+        choices=PriceObservation.Source.choices,
+    )
+    currency = models.CharField(max_length=20)
+    direction = models.CharField(max_length=3, choices=Direction.choices)
+    threshold = models.DecimalField(max_digits=30, decimal_places=9)
+    action = models.CharField(max_length=4, choices=Action.choices)
+    quantity = models.DecimalField(max_digits=30, decimal_places=9)
+    commission = models.DecimalField(max_digits=30, decimal_places=9, default=0)
+    enabled = models.BooleanField(default=True)
+    armed = models.BooleanField(default=True)
+    state_initialized = models.BooleanField(default=False)
+    baseline_at = models.DateTimeField(null=True, blank=True)
+    cursor_observed_at = models.DateTimeField(null=True, blank=True)
+    cursor_observation_id = models.PositiveBigIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("created_at", "pk")
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(threshold__gte=0),
+                name="strategy_threshold_nonnegative",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(quantity__gt=0),
+                name="strategy_quantity_positive",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(commission__gte=0),
+                name="strategy_commission_nonnegative",
+            ),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
 class PortfolioPosition(models.Model):
     portfolio = models.ForeignKey(
         VirtualPortfolio,
@@ -366,6 +438,10 @@ class PortfolioTransaction(models.Model):
         BUY = "buy", "Покупка (BUY)"
         SELL = "sell", "Продажа (SELL)"
 
+    class ExecutionType(models.TextChoices):
+        MANUAL = "manual", "Ручная виртуальная операция"
+        STRATEGY = "strategy", "Автоматическая виртуальная сделка стратегии"
+
     portfolio = models.ForeignKey(
         VirtualPortfolio,
         on_delete=models.CASCADE,
@@ -387,6 +463,29 @@ class PortfolioTransaction(models.Model):
     currency = models.CharField(max_length=20)
     executed_at = models.DateTimeField()
     idempotency_key = models.UUIDField(unique=True)
+    execution_type = models.CharField(
+        max_length=20,
+        choices=ExecutionType.choices,
+        default=ExecutionType.MANUAL,
+    )
+    strategy = models.ForeignKey(
+        TradingStrategy,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="transactions",
+    )
+    strategy_name = models.CharField(max_length=100, blank=True)
+    execution_observation = models.ForeignKey(
+        PriceObservation,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="virtual_transactions",
+    )
+    quote_source = models.CharField(max_length=20, blank=True)
+    quote_currency = models.CharField(max_length=20, blank=True)
+    quote_observed_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -417,3 +516,84 @@ class PortfolioTransaction(models.Model):
             f"{self.get_side_display()} {self.quantity} {self.share_ticker} "
             f"@ {self.execution_price} {self.currency}"
         )
+
+
+class StrategyEvaluation(models.Model):
+    class Decision(models.TextChoices):
+        NO_TRIGGER = "no_trigger", "Условие не выполнено"
+        REARMED = "rearmed", "Условие сброшено; стратегия взведена"
+        EXECUTED = "executed", "Виртуальная сделка исполнена"
+        REJECTED = "rejected", "Исполнение отклонено"
+        SKIPPED = "skipped", "Наблюдение пропущено"
+
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="strategy_evaluations",
+    )
+    portfolio = models.ForeignKey(
+        VirtualPortfolio,
+        on_delete=models.CASCADE,
+        related_name="strategy_evaluations",
+    )
+    strategy = models.ForeignKey(
+        TradingStrategy,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="evaluations",
+    )
+    strategy_name = models.CharField(max_length=100)
+    share = models.ForeignKey(
+        Share,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="strategy_evaluations",
+    )
+    share_ticker = models.CharField(max_length=10)
+    share_name = models.CharField(max_length=255)
+    observation = models.ForeignKey(
+        PriceObservation,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="strategy_evaluations",
+    )
+    observation_key = models.PositiveBigIntegerField()
+    observed_price = models.DecimalField(max_digits=30, decimal_places=9)
+    observed_currency = models.CharField(max_length=20)
+    observed_source = models.CharField(max_length=20)
+    observed_at = models.DateTimeField()
+    direction = models.CharField(max_length=3, choices=TradingStrategy.Direction.choices)
+    threshold = models.DecimalField(max_digits=30, decimal_places=9)
+    action = models.CharField(max_length=4, choices=TradingStrategy.Action.choices)
+    quantity = models.DecimalField(max_digits=30, decimal_places=9)
+    commission = models.DecimalField(max_digits=30, decimal_places=9)
+    decision = models.CharField(max_length=20, choices=Decision.choices)
+    reason = models.TextField(blank=True)
+    transaction = models.ForeignKey(
+        PortfolioTransaction,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="strategy_evaluations",
+    )
+    processed_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ("observed_at", "observation_key", "pk")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("strategy", "observation_key"),
+                name="unique_strategy_observation_evaluation",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=("portfolio", "processed_at"),
+                name="strategy_eval_portfolio_idx",
+            )
+        ]

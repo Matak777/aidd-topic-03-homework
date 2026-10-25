@@ -109,6 +109,10 @@ def execute_portfolio_transaction(
     currency,
     executed_at,
     idempotency_key,
+    execution_type=PortfolioTransaction.ExecutionType.MANUAL,
+    strategy=None,
+    strategy_name="",
+    execution_observation=None,
 ):
     portfolio = (
         VirtualPortfolio.objects.select_for_update()
@@ -144,6 +148,46 @@ def execute_portfolio_transaction(
             f"Валюта инструмента {share.currency} несовместима с портфелем "
             f"{portfolio.currency}; конвертация не выполняется."
         )
+    if execution_observation is not None:
+        if execution_observation.share_id != share.pk:
+            raise ValidationError(
+                "Наблюдение котировки относится к другому инструменту."
+            )
+        if (
+            execution_observation.price != execution_price
+            or execution_observation.currency.casefold() != currency.casefold()
+        ):
+            raise ValidationError(
+                "Цена или валюта операции не совпадает со снимком котировки."
+            )
+        if execution_observation.observed_at > executed_at:
+            raise ValidationError(
+                "Нельзя исполнить виртуальную операцию по будущей котировке."
+            )
+    if execution_type == PortfolioTransaction.ExecutionType.STRATEGY:
+        if strategy is None or execution_observation is None:
+            raise ValidationError(
+                "Для операции стратегии обязательны стратегия и котировка."
+            )
+        if (
+            strategy.share_id != share.pk
+            or strategy.portfolio_id != portfolio.pk
+            or strategy.owner_id != portfolio.owner_id
+        ):
+            raise ValidationError(
+                "Стратегия, портфель и инструмент операции не согласованы."
+            )
+        if (
+            strategy.action != side
+            or strategy.quantity != quantity
+            or strategy.commission != commission
+            or strategy.source != execution_observation.source
+            or strategy.currency.casefold()
+            != execution_observation.currency.casefold()
+        ):
+            raise ValidationError(
+                "Параметры операции не совпадают со снимком стратегии и котировки."
+            )
 
     existing = PortfolioTransaction.objects.filter(
         idempotency_key=idempotency_key
@@ -250,6 +294,19 @@ def execute_portfolio_transaction(
             currency=currency,
             executed_at=executed_at,
             idempotency_key=idempotency_key,
+            execution_type=execution_type,
+            strategy=strategy,
+            strategy_name=strategy_name,
+            execution_observation=execution_observation,
+            quote_source=(
+                execution_observation.source if execution_observation else ""
+            ),
+            quote_currency=(
+                execution_observation.currency if execution_observation else ""
+            ),
+            quote_observed_at=(
+                execution_observation.observed_at if execution_observation else None
+            ),
         )
     except IntegrityError as error:
         raise ValidationError(
