@@ -1,13 +1,29 @@
 from django.contrib.auth.mixins import LoginRequiredMixin
+from django.contrib.auth.decorators import login_required
+from django.db import transaction
+from django.http import HttpResponseBadRequest
 from django.shortcuts import redirect
 from django.urls import reverse_lazy
 from django.conf import settings
-from django.http import HttpResponseBadRequest
 from django.shortcuts import get_object_or_404, render
+from django.views.decorators.http import require_POST
 from django.views.generic import CreateView, DeleteView, DetailView, ListView, UpdateView
 
-from .forms import ShareModelForm
-from .models import PriceObservation, Share
+from .forms import (
+    ShareModelForm,
+    WatchlistForm,
+    WatchlistItemForm,
+    WatchRuleForm,
+)
+from .models import (
+    PriceAlert,
+    PriceObservation,
+    Share,
+    Watchlist,
+    WatchlistItem,
+    WatchRule,
+)
+from .services.price_alerts import initialize_new_rule_state, reset_rule_state
 from .services.graph import get_graph
 from .services.market_data import MarketDataError
 from .services.price_history import (
@@ -65,6 +81,189 @@ def share_price_history(request, pk):
             "live_available": bool(settings.TINKOFF_TOKEN),
         },
     )
+
+
+@login_required
+def watchlist_index(request):
+    form = WatchlistForm(
+        request.POST if request.method == "POST" else None,
+        owner=request.user,
+    )
+    if request.method == "POST" and form.is_valid():
+        watchlist = form.save(commit=False)
+        watchlist.owner = request.user
+        watchlist.save()
+        return redirect("dashboard:watchlist-detail", pk=watchlist.pk)
+    return render(
+        request,
+        "dashboard/watchlist_index.html",
+        {"watchlists": Watchlist.objects.filter(owner=request.user), "form": form},
+        status=400 if request.method == "POST" and form.errors else 200,
+    )
+
+
+@login_required
+def watchlist_detail(request, pk):
+    watchlist = get_object_or_404(Watchlist, pk=pk, owner=request.user)
+    action = request.POST.get("action") if request.method == "POST" else None
+    item_form = WatchlistItemForm(
+        request.POST if action == "add-item" else None,
+        watchlist=watchlist,
+    )
+    rule_form = WatchRuleForm(
+        request.POST if action == "add-rule" else None,
+    )
+    if action == "add-item" and item_form.is_valid():
+        item = item_form.save(commit=False)
+        item.watchlist = watchlist
+        item.save()
+        return redirect("dashboard:watchlist-detail", pk=watchlist.pk)
+    if action == "add-rule":
+        item_id = request.POST.get("item_id", "")
+        if not item_id.isdecimal():
+            return HttpResponseBadRequest("Некорректный инструмент списка.")
+        item = get_object_or_404(
+            WatchlistItem,
+            pk=int(item_id),
+            watchlist=watchlist,
+        )
+        rule_form = WatchRuleForm(request.POST, item=item)
+        if rule_form.is_valid():
+            with transaction.atomic():
+                rule = rule_form.save(commit=False)
+                rule.item = item
+                rule.save()
+                initialize_new_rule_state(rule)
+            return redirect("dashboard:watchlist-detail", pk=watchlist.pk)
+    invalid_post = request.method == "POST" and (
+        action not in {"add-item", "add-rule"}
+        or item_form.errors
+        or rule_form.errors
+    )
+    return render(
+        request,
+        "dashboard/watchlist_detail.html",
+        {
+            "watchlist": watchlist,
+            "item_form": item_form,
+            "rule_form": rule_form,
+            "items": watchlist.items.select_related("share").prefetch_related("rules"),
+        },
+        status=400 if invalid_post else 200,
+    )
+
+
+@login_required
+@require_POST
+def watchlist_rename(request, pk):
+    watchlist = get_object_or_404(Watchlist, pk=pk, owner=request.user)
+    form = WatchlistForm(request.POST, instance=watchlist, owner=request.user)
+    if form.is_valid():
+        form.save()
+        return redirect("dashboard:watchlist-detail", pk=watchlist.pk)
+    return render(
+        request,
+        "dashboard/watchlist_detail.html",
+        {
+            "watchlist": watchlist,
+            "item_form": WatchlistItemForm(watchlist=watchlist),
+            "rule_form": WatchRuleForm(),
+            "rename_form": form,
+            "items": watchlist.items.select_related("share").prefetch_related("rules"),
+        },
+        status=400,
+    )
+
+
+@login_required
+@require_POST
+def watchlist_delete(request, pk):
+    watchlist = get_object_or_404(Watchlist, pk=pk, owner=request.user)
+    watchlist.delete()
+    return redirect("dashboard:watchlists")
+
+
+@login_required
+def watch_rule_edit(request, pk):
+    rule = get_object_or_404(
+        WatchRule.objects.select_related("item__watchlist", "item__share"),
+        pk=pk,
+        item__watchlist__owner=request.user,
+    )
+    form = WatchRuleForm(
+        request.POST if request.method == "POST" else None,
+        instance=rule,
+    )
+    if request.method == "POST" and form.is_valid():
+        with transaction.atomic():
+            rule = WatchRule.objects.select_for_update().get(pk=pk)
+            for field in ("source", "currency", "direction", "threshold"):
+                setattr(rule, field, form.cleaned_data[field])
+            rule.save()
+            reset_rule_state(rule)
+        return redirect("dashboard:watchlist-detail", pk=rule.item.watchlist_id)
+    return render(
+        request,
+        "dashboard/watch_rule_edit.html",
+        {"rule": rule, "form": form},
+        status=400 if request.method == "POST" and form.errors else 200,
+    )
+
+
+@login_required
+@require_POST
+def watch_rule_toggle(request, pk):
+    rule = get_object_or_404(
+        WatchRule, pk=pk, item__watchlist__owner=request.user
+    )
+    enabled_value = request.POST.get("enabled")
+    if enabled_value not in {"true", "false"}:
+        return HttpResponseBadRequest("Ожидается enabled=true или enabled=false.")
+    with transaction.atomic():
+        rule = WatchRule.objects.select_for_update().get(pk=pk)
+        rule.enabled = enabled_value == "true"
+        rule.save(update_fields=("enabled", "updated_at"))
+        reset_rule_state(rule)
+    return redirect("dashboard:watchlist-detail", pk=rule.item.watchlist_id)
+
+
+@login_required
+@require_POST
+def watch_rule_delete(request, pk):
+    rule = get_object_or_404(
+        WatchRule, pk=pk, item__watchlist__owner=request.user
+    )
+    watchlist_id = rule.item.watchlist_id
+    rule.delete()
+    return redirect("dashboard:watchlist-detail", pk=watchlist_id)
+
+
+@login_required
+@require_POST
+def watchlist_item_delete(request, pk):
+    item = get_object_or_404(
+        WatchlistItem, pk=pk, watchlist__owner=request.user
+    )
+    watchlist_id = item.watchlist_id
+    item.delete()
+    return redirect("dashboard:watchlist-detail", pk=watchlist_id)
+
+
+@login_required
+def price_alert_list(request):
+    alerts = PriceAlert.objects.filter(owner=request.user).select_related(
+        "observation"
+    )
+    return render(request, "dashboard/price_alerts.html", {"alerts": alerts})
+
+
+@login_required
+@require_POST
+def price_alert_mark_read(request, pk):
+    alert = get_object_or_404(PriceAlert, pk=pk, owner=request.user)
+    alert.is_read = True
+    alert.save(update_fields=("is_read",))
+    return redirect("dashboard:price-alerts")
 
 
 class ShareCreateView(LoginRequiredMixin, CreateView):

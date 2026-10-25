@@ -45,4 +45,7 @@ def _update_last_price(share_id=None, *, stop_event=None):
                 "updated_at",
             )
         )
+    from dashboard.services.price_alerts import process_price_alerts
+
+    process_price_alerts(share_id=share_id)
     return updated

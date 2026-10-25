@@ -1,0 +1,78 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}<title>{{ watchlist.name }}</title>{% endblock %}
+
+{% block content %}
+<p><a href="{% url 'dashboard:watchlists' %}">К моим спискам</a></p>
+<h1>{{ watchlist.name }}</h1>
+<form method="post" action="{% url 'dashboard:watchlist-rename' watchlist.pk %}">
+    {% csrf_token %}
+    {% if rename_form %}{{ rename_form.as_p }}{% else %}
+        <label for="id_name">Новое название</label>
+        <input id="id_name" name="name" value="{{ watchlist.name }}" maxlength="100" required>
+    {% endif %}
+    <button class="btn btn-secondary" type="submit">Переименовать</button>
+</form>
+<form method="post" action="{% url 'dashboard:watchlist-delete' watchlist.pk %}">
+    {% csrf_token %}
+    <button class="btn btn-danger" type="submit">Удалить список</button>
+</form>
+
+<h2>Инструменты и правила</h2>
+<ul>
+    {% for item in items %}
+        <li>
+            <strong>{{ item.share.ticker }} — {{ item.share.name }}</strong>
+            <form method="post" action="{% url 'dashboard:watchlist-item-delete' item.pk %}" style="display:inline">
+                {% csrf_token %}
+                <button type="submit">Удалить инструмент</button>
+            </form>
+            <ul>
+                {% for rule in item.rules.all %}
+                    <li>
+                        {{ rule.get_direction_display }} {{ rule.threshold }} {{ rule.currency|upper }}
+                        ({{ rule.get_source_display }})
+                        {% if rule.source == "demo" %}<strong>(ДЕМО)</strong>{% endif %}
+                        {% if rule.enabled %}Включено{% else %}Отключено{% endif %}
+                        {% if rule.armed %} · ожидает входа в условие{% else %} · ожидает выхода из условия{% endif %}
+                        <a href="{% url 'dashboard:watch-rule-edit' rule.pk %}">Изменить</a>
+                        <form method="post" action="{% url 'dashboard:watch-rule-toggle' rule.pk %}" style="display:inline">
+                            {% csrf_token %}
+                            {% if rule.enabled %}
+                                <input type="hidden" name="enabled" value="false">
+                                <button type="submit">Отключить</button>
+                            {% else %}
+                                <input type="hidden" name="enabled" value="true">
+                                <button type="submit">Включить</button>
+                            {% endif %}
+                        </form>
+                        <form method="post" action="{% url 'dashboard:watch-rule-delete' rule.pk %}" style="display:inline">
+                            {% csrf_token %}
+                            <button type="submit">Удалить правило</button>
+                        </form>
+                    </li>
+                {% empty %}
+                    <li>Для инструмента нет ценовых правил.</li>
+                {% endfor %}
+            </ul>
+            <form method="post">
+                {% csrf_token %}
+                <input type="hidden" name="action" value="add-rule">
+                <input type="hidden" name="item_id" value="{{ item.pk }}">
+                {{ rule_form.as_p }}
+                <button class="btn btn-primary" type="submit">Добавить ценовое правило</button>
+            </form>
+        </li>
+    {% empty %}
+        <li>Инструментов пока нет.</li>
+    {% endfor %}
+</ul>
+
+<h2>Добавить инструмент</h2>
+<form method="post">
+    {% csrf_token %}
+    <input type="hidden" name="action" value="add-item">
+    {{ item_form.as_p }}
+    <button class="btn btn-primary" type="submit">Добавить инструмент</button>
+</form>
+{% endblock %}

@@ -1,0 +1,13 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}<title>Изменить правило</title>{% endblock %}
+
+{% block content %}
+<h1>Изменить правило для {{ rule.item.share.ticker }}</h1>
+<form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button class="btn btn-primary" type="submit">Сохранить</button>
+    <a class="btn btn-secondary" href="{% url 'dashboard:watchlist-detail' rule.item.watchlist_id %}">Отмена</a>
+</form>
+{% endblock %}

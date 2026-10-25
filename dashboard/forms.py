@@ -1,7 +1,13 @@
 from django import forms
 from django.core.exceptions import ValidationError
 
-from .models import Share
+from .models import (
+    PriceObservation,
+    Share,
+    Watchlist,
+    WatchlistItem,
+    WatchRule,
+)
 
 
 class ShareModelForm(forms.ModelForm):
@@ -51,3 +57,93 @@ class ShareModelForm(forms.ModelForm):
             instance.save()
             self.save_m2m()
         return instance
+
+
+class WatchlistForm(forms.ModelForm):
+    class Meta:
+        model = Watchlist
+        fields = ("name",)
+
+    def __init__(self, *args, owner, **kwargs):
+        self.owner = owner
+        super().__init__(*args, **kwargs)
+
+    def clean_name(self):
+        name = self.cleaned_data["name"].strip()
+        duplicate = Watchlist.objects.filter(owner=self.owner, name=name)
+        if self.instance.pk:
+            duplicate = duplicate.exclude(pk=self.instance.pk)
+        if duplicate.exists():
+            raise ValidationError("У вас уже есть список с таким названием.")
+        return name
+
+
+class WatchlistItemForm(forms.ModelForm):
+    class Meta:
+        model = WatchlistItem
+        fields = ("share",)
+
+    def __init__(self, *args, watchlist, **kwargs):
+        self.watchlist = watchlist
+        super().__init__(*args, **kwargs)
+        existing_share_ids = watchlist.items.values_list("share_id", flat=True)
+        self.fields["share"].queryset = Share.objects.exclude(
+            pk__in=existing_share_ids
+        ).order_by("ticker")
+
+
+class WatchRuleForm(forms.ModelForm):
+    source = forms.ChoiceField(choices=PriceObservation.Source.choices)
+    currency = forms.ChoiceField()
+
+    class Meta:
+        model = WatchRule
+        fields = ("source", "currency", "direction", "threshold")
+
+    def __init__(self, *args, item=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.item = item or (self.instance.item if self.instance.pk else None)
+        currencies = set(
+            value.lower()
+            for value in Share.objects.values_list("currency", flat=True)
+            if value
+        )
+        currencies.update(
+            value.lower()
+            for value in PriceObservation.objects.values_list(
+                "currency", flat=True
+            ).distinct()
+            if value
+        )
+        self.fields["currency"].choices = [
+            (value, value.upper()) for value in sorted(currencies)
+        ]
+
+    def clean_currency(self):
+        return self.cleaned_data["currency"].strip().lower()
+
+    def clean_threshold(self):
+        threshold = self.cleaned_data["threshold"]
+        if threshold < 0:
+            raise ValidationError("Пороговая цена не может быть отрицательной.")
+        return threshold
+
+    def clean(self):
+        cleaned_data = super().clean()
+        source = cleaned_data.get("source")
+        currency = cleaned_data.get("currency")
+        direction = cleaned_data.get("direction")
+        threshold = cleaned_data.get("threshold")
+        if self.item and all(
+            value is not None for value in (source, currency, direction, threshold)
+        ):
+            duplicate = WatchRule.objects.filter(
+                item=self.item,
+                source=source,
+                currency__iexact=currency,
+                direction=direction,
+                threshold=threshold,
+            ).exclude(pk=self.instance.pk)
+            if duplicate.exists():
+                raise ValidationError("Такое правило уже есть в этом списке.")
+        return cleaned_data

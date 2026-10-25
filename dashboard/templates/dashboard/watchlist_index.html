@@ -1,0 +1,20 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}<title>Мои списки наблюдения</title>{% endblock %}
+
+{% block content %}
+<h1>Мои списки наблюдения</h1>
+<ul>
+    {% for watchlist in watchlists %}
+        <li><a href="{% url 'dashboard:watchlist-detail' watchlist.pk %}">{{ watchlist.name }}</a></li>
+    {% empty %}
+        <li>Списков пока нет.</li>
+    {% endfor %}
+</ul>
+<h2>Создать список</h2>
+<form method="post">
+    {% csrf_token %}
+    {{ form.as_p }}
+    <button class="btn btn-primary" type="submit">Создать</button>
+</form>
+{% endblock %}

@@ -1,0 +1,27 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}<title>Уведомления</title>{% endblock %}
+
+{% block content %}
+<h1>Уведомления о цене</h1>
+<p>Уведомления доступны только владельцу. Это сообщения внутри приложения; внешняя рассылка не выполняется.</p>
+<ul>
+    {% for alert in alerts %}
+        <li>
+            <strong>{{ alert.share_ticker }} — {{ alert.price }} {{ alert.currency|upper }}</strong>
+            {% if alert.source == "demo" %}<strong>(ДЕМО, синтетические данные)</strong>{% endif %}
+            <span>{{ alert.get_direction_display }} {{ alert.threshold }} {{ alert.currency|upper }}</span>
+            <span>Источник: {{ alert.get_source_display }}</span>
+            <time datetime="{{ alert.observed_at|date:'c' }}">{{ alert.observed_at }}</time>
+            {% if not alert.is_read %}
+                <form method="post" action="{% url 'dashboard:price-alert-read' alert.pk %}" style="display:inline">
+                    {% csrf_token %}
+                    <button type="submit">Отметить прочитанным</button>
+                </form>
+            {% else %}<span>Прочитано</span>{% endif %}
+        </li>
+    {% empty %}
+        <li>Уведомлений пока нет.</li>
+    {% endfor %}
+</ul>
+{% endblock %}

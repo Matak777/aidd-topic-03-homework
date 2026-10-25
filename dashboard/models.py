@@ -1,4 +1,5 @@
 from django.core.exceptions import ValidationError
+from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
@@ -107,3 +108,152 @@ class PriceObservation(models.Model):
 
     def __str__(self):
         return f"{self.share.ticker}: {self.price} {self.currency} @ {self.observed_at}"
+
+
+class Watchlist(models.Model):
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="watchlists",
+    )
+    name = models.CharField(max_length=100)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("name", "pk")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("owner", "name"),
+                name="unique_watchlist_name_per_owner",
+            )
+        ]
+
+    def __str__(self):
+        return self.name
+
+
+class WatchlistItem(models.Model):
+    watchlist = models.ForeignKey(
+        Watchlist,
+        on_delete=models.CASCADE,
+        related_name="items",
+    )
+    share = models.ForeignKey(
+        Share,
+        on_delete=models.CASCADE,
+        related_name="watchlist_items",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("share__ticker", "pk")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("watchlist", "share"),
+                name="unique_share_per_watchlist",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.watchlist.name}: {self.share.ticker}"
+
+
+class WatchRule(models.Model):
+    class Direction(models.TextChoices):
+        AT_LEAST = "gte", "Цена не ниже порога (>=)"
+        AT_MOST = "lte", "Цена не выше порога (<=)"
+
+    item = models.ForeignKey(
+        WatchlistItem,
+        on_delete=models.CASCADE,
+        related_name="rules",
+    )
+    source = models.CharField(max_length=20, choices=PriceObservation.Source.choices)
+    currency = models.CharField(max_length=20)
+    direction = models.CharField(max_length=3, choices=Direction.choices)
+    threshold = models.DecimalField(max_digits=30, decimal_places=9)
+    enabled = models.BooleanField(default=True)
+    armed = models.BooleanField(default=True)
+    state_initialized = models.BooleanField(default=False)
+    cursor_observed_at = models.DateTimeField(null=True, blank=True)
+    cursor_observation_id = models.PositiveBigIntegerField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("item__share__ticker", "source", "currency", "pk")
+        constraints = [
+            models.UniqueConstraint(
+                fields=(
+                    "item",
+                    "source",
+                    "currency",
+                    "direction",
+                    "threshold",
+                ),
+                name="unique_watch_rule_condition",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=("enabled", "cursor_observed_at"),
+                name="watch_rule_cursor_idx",
+            )
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.item.share.ticker} {self.get_direction_display()} "
+            f"{self.threshold} {self.currency} ({self.source})"
+        )
+
+
+class PriceAlert(models.Model):
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="price_alerts",
+    )
+    rule = models.ForeignKey(
+        WatchRule,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="alerts",
+    )
+    observation = models.ForeignKey(
+        PriceObservation,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="alerts",
+    )
+    share_ticker = models.CharField(max_length=10)
+    share_name = models.CharField(max_length=255)
+    price = models.DecimalField(max_digits=30, decimal_places=9)
+    threshold = models.DecimalField(max_digits=30, decimal_places=9)
+    direction = models.CharField(max_length=3, choices=WatchRule.Direction.choices)
+    source = models.CharField(max_length=20, choices=PriceObservation.Source.choices)
+    currency = models.CharField(max_length=20)
+    observed_at = models.DateTimeField()
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-observed_at", "-pk")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("rule", "observation"),
+                name="unique_alert_per_rule_observation",
+            )
+        ]
+        indexes = [
+            models.Index(
+                fields=("owner", "is_read", "observed_at"),
+                name="alert_owner_unread_idx",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.share_ticker}: {self.price} {self.currency}"

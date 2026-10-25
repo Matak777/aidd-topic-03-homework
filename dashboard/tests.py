@@ -14,7 +14,14 @@ from django.utils import timezone as django_timezone
 from rest_framework import status
 from rest_framework.test import APIClient, APITestCase
 
-from dashboard.models import PriceObservation, Share
+from dashboard.models import (
+    PriceAlert,
+    PriceObservation,
+    Share,
+    Watchlist,
+    WatchlistItem,
+    WatchRule,
+)
 from dashboard.services.market_data import MarketDataError, get_last_data
 from dashboard.services.price_history import get_price_history
 
@@ -97,6 +104,63 @@ class ShareAPITests(APITestCase):
         response = self.client.delete(f"/api/v1/shares/{self.share.pk}/")
         self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
         self.assertFalse(Share.objects.filter(pk=self.share.pk).exists())
+
+    def test_delete_share_keeps_all_owners_alert_snapshots(self):
+        other_user = User.objects.create_user(
+            username="other-api@example.com",
+            email="other-api@example.com",
+            password="safe-password",
+        )
+        observation = PriceObservation.objects.create(
+            share=self.share,
+            price=Decimal("101.25"),
+            currency="USD",
+            source=PriceObservation.Source.DEMO,
+            observed_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+        alerts = []
+        for user, name in ((self.user, "API owner"), (other_user, "Other owner")):
+            watchlist = Watchlist.objects.create(owner=user, name=name)
+            item = WatchlistItem.objects.create(
+                watchlist=watchlist,
+                share=self.share,
+            )
+            rule = WatchRule.objects.create(
+                item=item,
+                source=PriceObservation.Source.DEMO,
+                currency="usd",
+                direction=WatchRule.Direction.AT_LEAST,
+                threshold=Decimal("100"),
+            )
+            alerts.append(
+                PriceAlert.objects.create(
+                    owner=user,
+                    rule=rule,
+                    observation=observation,
+                    share_ticker=self.share.ticker,
+                    share_name=self.share.name,
+                    price=observation.price,
+                    threshold=Decimal("100"),
+                    direction=WatchRule.Direction.AT_LEAST,
+                    source=PriceObservation.Source.DEMO,
+                    currency=observation.currency,
+                    observed_at=observation.observed_at,
+                )
+            )
+
+        response = self.client.delete(f"/api/v1/shares/{self.share.pk}/")
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(Share.objects.filter(pk=self.share.pk).exists())
+        self.assertFalse(PriceObservation.objects.filter(pk=observation.pk).exists())
+        self.assertEqual(PriceAlert.objects.count(), 2)
+        for alert in alerts:
+            alert.refresh_from_db()
+            self.assertIsNone(alert.observation_id)
+            self.assertIsNone(alert.rule_id)
+            self.assertEqual(alert.share_ticker, "AAPL")
+            self.assertEqual(alert.share_name, "Apple")
+            self.assertEqual(alert.price, Decimal("101.25"))
 
     def test_changing_currency_invalidates_cached_price_but_keeps_observation_currency(self):
         observed_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
