@@ -8,11 +8,13 @@ app = Celery("config")
 
 app.config_from_object("django.conf:settings", namespace="CELERY")
 
-app.autodiscover_tasks()
-
+# Имя записи соответствует фактическому интервалу (в исходнике имя
+# «add-every-5-min» не совпадало с schedule 10 с — рассогласование устранено).
 app.conf.beat_schedule = {
-    "add-every-5-min": {
+    "update-prices-every-10-seconds": {
         "task": "dashboard.tasks.update_last_price",
         "schedule": 10.0,
     },
 }
+
+app.autodiscover_tasks()

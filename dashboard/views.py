@@ -1,11 +1,17 @@
-from django.shortcuts import render, redirect
+from django.contrib.auth.mixins import UserPassesTestMixin
+from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse_lazy
-from django.views.generic import CreateView, DeleteView, ListView, View, UpdateView
+from django.views.generic import (
+    CreateView,
+    DeleteView,
+    ListView,
+    UpdateView,
+    View,
+)
 
 from .forms import ShareModelForm
 from .models import Share
 from .services.graph import get_graph
-from django.contrib.auth.mixins import UserPassesTestMixin
 
 
 class IsUserAuthenticatedMixin(UserPassesTestMixin):
@@ -27,14 +33,24 @@ class ShareListView(ListView):
 
 
 class ShareDetailView(View):
+    """Карточка акции с графиком; проблемы рыночных данных показываются
+    на странице явно, не валя запрос с 500."""
+
     @staticmethod
     def get(request, pk):
-        share = Share.objects.get(id=pk)
+        share = get_object_or_404(Share, id=pk)
+        plot_div = None
+        graph_error = None
+        try:
+            plot_div = get_graph(share)
+        except Exception as e:
+            # включая отсутствие TINKOFF_TOKEN и проблемы сети/API
+            graph_error = str(e)
 
         return render(
             request,
             "dashboard/detail.html",
-            {"plot_div": get_graph(share), "share": share},
+            {"plot_div": plot_div, "graph_error": graph_error, "share": share},
         )
 
 

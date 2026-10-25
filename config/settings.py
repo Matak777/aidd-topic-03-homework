@@ -1,14 +1,42 @@
 import logging
+import os
 from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = ""
+# Конфигурация через переменные окружения и файл .env (см. .env.example).
+# Файл .env не обязателен: переменные окружения имеют приоритет.
+load_dotenv(BASE_DIR / ".env")
 
-DEBUG = True
+_env = os.environ.get
+_bool = lambda v: str(v).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}  # noqa: E731
 
-ALLOWED_HOSTS = []
 
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(_env(name, ""))
+    except (TypeError, ValueError):
+        return default
+
+
+# --- Core Django ---
+# Для разработки допускается ключ по умолчанию; в production обязательно
+# переопределяйте SECRET_KEY переменной окружения.
+SECRET_KEY = _env("SECRET_KEY", "django-insecure-dev-only-key-change-me")
+DEBUG = _bool(_env("DJANGO_DEBUG", "on"))
+ALLOWED_HOSTS = [
+    h.strip()
+    for h in _env("DJANGO_ALLOWED_HOSTS", "127.0.0.1,localhost").split(",")
+    if h.strip()
+]
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -31,7 +59,15 @@ CRISPY_TEMPLATE_PACK = "bootstrap3"
 REST_FRAMEWORK = {
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.LimitOffsetPagination",
     "PAGE_SIZE": 100,
-    "DEFAULT_FILTER_BACKENDS": ["django_filters.rest_framework.DjangoFilterBackend"],
+    "DEFAULT_FILTER_BACKENDS": [
+        "django_filters.rest_framework.DjangoFilterBackend"
+    ],
+    # Анонимно — только чтение; запись (POST/PUT/PATCH/DELETE) — только
+    # аутентифицированным (исправление Д12 из ANALYSIS.md: полный
+    # анонимный CRUD был дефектом, а не требованием).
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticatedOrReadOnly",
+    ],
 }
 
 LOGGING = {
@@ -44,29 +80,26 @@ LOGGING = {
         }
     },
     "handlers": {
-        "console": {"class": "logging.StreamHandler", "formatter": "main_format"},
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "main_format",
+        },
         "file": {
             "class": "logging.FileHandler",
             "formatter": "main_format",
-            "filename": "app.logs",
+            "filename": _env("LOG_FILE", "app.logs"),
         },
     },
     "loggers": {
-        "main": {"handlers": ["console", "file"], "level": "INFO", "propagate": True}
+        "main": {
+            "handlers": ["console", "file"],
+            "level": "INFO",
+            "propagate": True,
+        }
     },
 }
 
 logger = logging.getLogger("main")
-
-MIDDLEWARE = [
-    "django.middleware.security.SecurityMiddleware",
-    "django.contrib.sessions.middleware.SessionMiddleware",
-    "django.middleware.common.CommonMiddleware",
-    "django.middleware.csrf.CsrfViewMiddleware",
-    "django.contrib.auth.middleware.AuthenticationMiddleware",
-    "django.contrib.messages.middleware.MessageMiddleware",
-    "django.middleware.clickjacking.XFrameOptionsMiddleware",
-]
 
 ROOT_URLCONF = "config.urls"
 
@@ -86,22 +119,41 @@ TEMPLATES = [
     },
 ]
 
+MIDDLEWARE = [
+    "django.middleware.security.SecurityMiddleware",
+    "django.contrib.sessions.middleware.SessionMiddleware",
+    "django.middleware.common.CommonMiddleware",
+    "django.middleware.csrf.CsrfViewMiddleware",
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "django.contrib.messages.middleware.MessageMiddleware",
+    "django.middleware.clickjacking.XFrameOptionsMiddleware",
+]
+
 WSGI_APPLICATION = "config.wsgi.application"
 
-DATABASES = {
-    # 'default': {
-    #     'ENGINE': 'django.db.backends.sqlite3',
-    #     'NAME': BASE_DIR / 'db.sqlite3',
-    # }
-    "default": {
-        "ENGINE": "django.db.backends.postgresql",
-        "NAME": "investing",
-        "USER": "postgres",
-        "PASSWORD": "postgres",
-        "HOST": "localhost",
-        "PORT": "5432",
+# --- База данных ---
+# По умолчанию SQLite (достаточно для локального запуска без Docker).
+# Для PostgreSQL установите DATABASE=postgres и переменные DB_*.
+DATABASE = _env("DATABASE", "sqlite").lower()
+
+if DATABASE == "postgres":
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": _env("DB_NAME", "investing"),
+            "USER": _env("DB_USER", "postgres"),
+            "PASSWORD": _env("DB_PASSWORD", ""),
+            "HOST": _env("DB_HOST", "localhost"),
+            "PORT": _env("DB_PORT", "5432"),
+        }
     }
-}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / _env("DB_NAME", "db.sqlite3"),
+        }
+    }
 
 AUTH_PASSWORD_VALIDATORS = [
     {
@@ -121,7 +173,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = "en-us"
 
-TIME_ZONE = "UTC"
+TIME_ZONE = _env("TIME_ZONE", "UTC")
 
 USE_I18N = True
 
@@ -131,14 +183,32 @@ STATIC_URL = "static/"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-TINKOFF_TOKEN = ""
+# --- Внешние сервисы ---
+# Токен Tinkoff Invest API задаётся только через окружение (.env/TINKOFF_TOKEN).
+# Пустое значение разрешено: приложение запускается, но интеграции с рынком
+# явно сообщают об отсутствии токена (см. dashboard/services/market_data.py).
+TINKOFF_TOKEN = _env("TINKOFF_TOKEN", "")
+TINKOFF_APP_NAME = _env("TINKOFF_APP_NAME", "investing-demo")
 
-"""Celery Configuration Options"""
-CELERY_TIMEZONE = "Europe/Moscow"
-CELERY_TASK_TRACK_STARTED = True
-CELERY_TASK_TIME_LIMIT = 30 * 60
-# CELERY_BROKER_URL = 'amqp://guest:guest@localhost:5672'
-CELERY_BROKER_URL = "redis://127.0.0.1:6379/0"
+# Ограничение времени реальных внешних запросов к Tinkoff API (сек).
+# Валидация окончательно выполняется перед каждым RPC (validate_timeout).
+_raw_tinkoff_timeout = _env("TINKOFF_TIMEOUT", "")
+if _raw_tinkoff_timeout:
+    try:
+        TINKOFF_TIMEOUT = float(_raw_tinkoff_timeout)
+    except ValueError:
+        raise ImproperlyConfigured(
+            f"TINKOFF_TIMEOUT должно быть конечным положительным числом "
+            f"секунд, получено: {_raw_tinkoff_timeout!r}"
+        )
+else:
+    TINKOFF_TIMEOUT = 30.0
 
-"""Debug Celery"""
-CELERY_TASK_ALWAYS_EAGER = False
+# --- Celery ---
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_TRACK_STARTED = _bool(_env("CELERY_TASK_TRACK_STARTED", "on"))
+CELERY_TASK_TIME_LIMIT = _int_env("CELERY_TASK_TIME_LIMIT", 1800)
+# Брокер по умолчанию — Redis; позже его отсутствие приводит к явной ошибке
+# соединения Celery, а не к скрытым потерям задач.
+CELERY_BROKER_URL = _env("CELERY_BROKER_URL", "redis://127.0.0.1:6379/0")
+CELERY_TASK_ALWAYS_EAGER = _bool(_env("CELERY_TASK_ALWAYS_EAGER", "off"))

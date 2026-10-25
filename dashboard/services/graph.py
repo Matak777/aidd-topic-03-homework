@@ -2,22 +2,44 @@ from datetime import timedelta
 
 from plotly.graph_objs import Scatter
 from plotly.offline import plot
-from tinkoff.invest import CandleInterval, Client
+from tinkoff.invest import CandleInterval
 from tinkoff.invest.utils import now
 
-from config.settings import TINKOFF_TOKEN
+from dashboard.services.market_data import (
+    apply_rpc_deadline,
+    get_tinkoff_timeout,
+    money_to_float,
+    open_tinkoff_client,
+    run_with_timeout,
+)
 
 
 def get_graph(share):
-    with Client(TINKOFF_TOKEN) as client:
-        x_data, y_data = [], []
-        for candle in client.get_all_candles(
-            figi=share.figi,
-            from_=now() - timedelta(days=180),
-            interval=CandleInterval.CANDLE_INTERVAL_DAY,
-        ):
-            x_data.append(candle.time.date())
-            y_data.append(candle.close.units)
+    """Строит HTML-график (Plotly) цены акции за 180 дней (дневные свечи)."""
+    x_data, y_data = [], []
+    deadline = get_tinkoff_timeout()
+
+    def fetch_candles():
+        with open_tinkoff_client() as client:
+            # Каждая RPC-страница get_all_candles ограничена собственным
+            # gRPC-дедлайном; суммарное локальное ожидание ограничено
+            # run_with_timeout.
+            apply_rpc_deadline(client, deadline)
+            collected = []
+            for candle in client.get_all_candles(
+                figi=share.figi,
+                from_=now() - timedelta(days=180),
+                interval=CandleInterval.CANDLE_INTERVAL_DAY,
+            ):
+                collected.append((candle.time.date(), candle.close))
+            return collected
+
+    candles = run_with_timeout(fetch_candles, deadline, "get_graph")
+    for candle_date, close in candles:
+        x_data.append(candle_date)
+        # close — Quotation (units + nano): учитываем дробную часть целиком.
+        y_data.append(money_to_float(close))
+
     plot_div = plot(
         [
             Scatter(
