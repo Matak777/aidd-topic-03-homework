@@ -38,41 +38,52 @@ class Command(BaseCommand):
 
         created, updated = 0, 0
         for share in shares_response.instruments:
-            # Ключ поиска — figi; остальные поля (в т.ч. уникальные
-            # ticker/uid) при изменении на стороне API обновляются
-            # вместо падения с IntegrityError.
-            _, was_created = Share.objects.get_or_create(
-                figi=share.figi,
-                defaults={
-                    "name": share.name,
-                    "isin": share.isin,
+            # Ключ поиска — figi (идентичность источника; сама она не меняется
+            # при обновлении каталога). fix 4: у акции, у которой накоплена
+            # история наблюдений, запрещено менять идентичность (uid/ticker)
+            # и валюту — это подменяет инструмент, к которому относится
+            # история; такие поля пропускаются с журналированием.
+            existing = Share.objects.filter(figi=share.figi).first()
+            if existing is None:
+                Share.objects.create(
+                    figi=share.figi,
+                    name=share.name,
+                    isin=share.isin,
+                    ticker=share.ticker,
+                    currency=share.currency,
+                    uid=share.uid,
+                )
+                created += 1
+                continue
+            changed_fields = {
+                "name": share.name,
+                "isin": share.isin,
+            }
+            protected = existing.protected_identity_changes(
+                {
                     "ticker": share.ticker,
                     "currency": share.currency,
                     "uid": share.uid,
-                },
+                }
             )
-            if not was_created:
-                changed = (
-                    Share.objects.filter(figi=share.figi)
-                    .exclude(
-                        name=share.name,
-                        isin=share.isin,
-                        ticker=share.ticker,
-                        currency=share.currency,
-                        uid=share.uid,
-                    )
-                    .update(
-                        name=share.name,
-                        isin=share.isin,
-                        ticker=share.ticker,
-                        currency=share.currency,
-                        uid=share.uid,
-                    )
+            if protected:
+                self.stdout.write(
+                    f"add_shares: пропуск защищённых полей {protected} для "
+                    f"{share.ticker} (у акции накоплена история цен)"
                 )
-                if changed:
-                    updated += 1
             else:
-                created += 1
+                for field, value in (
+                    ("ticker", share.ticker),
+                    ("currency", share.currency),
+                    ("uid", share.uid),
+                ):
+                    changed_fields[field] = value
+            if (
+                Share.objects.filter(figi=share.figi)
+                .exclude(**changed_fields)
+                .update(**changed_fields)
+            ):
+                updated += 1
         self.stdout.write(
             self.style.SUCCESS(
                 f"add_shares created: {created}, updated: {updated}"

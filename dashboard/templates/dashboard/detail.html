@@ -9,8 +9,18 @@
     <div class="col3"></div>
     <div class="col3">
         Инструмент: {{ share.name }} <br>
-        Текущая цена: {{ share.last_price }} {{ share.currency }} <br>
-        Время последнего обновления: {{ share.updated_at }}
+        Текущая цена: {{ share.last_price }} {{ share.currency }}
+        {% if share.last_price is not None %}
+            <em>(
+                {% if share.last_price_source == "demo" %}demo — демонстрационные данные, не живые котировки
+                {% elif share.last_price_source == "manual" %}введено вручную
+                {% elif share.last_price_source == "tinkoff" %}источник: Tinkoff Invest API
+                {% else %}источник неизвестен{% endif %}
+            )</em>
+        {% endif %}<br>
+        Время последнего обновления: {{ share.updated_at }} <br>
+        Сбор цен: <code>python manage.py collect_prices</code> (demo-режим включается настройкой PRICE_SOURCE=demo) <br>
+        <a href="{% url 'dashboard:history' share.id %}" class="btn btn-outline-secondary mt-2">История цен</a>
     </div>
     <div class="col3"></div>
     </div>

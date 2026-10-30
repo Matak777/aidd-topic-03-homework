@@ -20,6 +20,7 @@
                 <th scope="col">Название</th>
                 <th scope="col">ISIN</th>
                 <th scope="col">Текущая цена</th>
+                <th scope="col">История</th>
                 {% if user.is_authenticated %}
                     <th scope="col">Управление</th>
                 {% endif %}
@@ -39,7 +40,23 @@
                         {% else %}
                     <td>
                     {% endif %}
-                    {{share.last_price}} {{ share.currency }}</td>
+                    {{share.last_price}} {{ share.currency }}
+                    {% if share.last_price is not None %}
+                    {% if share.last_price_source == "demo" %}
+                        <em>(demo)</em>
+                    {% elif share.last_price_source == "manual" %}
+                        <em>(вручную)</em>
+                    {% elif share.last_price_source == "tinkoff" %}
+                        {% comment %} рыночная цена с явным источником {% endcomment %}
+                    {% else %}
+                        <em>(источник неизвестен)</em>
+                    {% endif %}
+                    {% endif %}</td>
+                    <td>
+                        <a href="{% url 'dashboard:history' share.id %}" class="btn btn-outline-secondary btn-sm">
+                            История цен
+                        </a>
+                    </td>
                     {% if user.is_authenticated %}
                         <td>
                             <a href="{% url 'dashboard:update' share.id %}" class="btn btn-secondary">

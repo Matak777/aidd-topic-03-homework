@@ -192,17 +192,48 @@ TINKOFF_APP_NAME = _env("TINKOFF_APP_NAME", "investing-demo")
 
 # Ограничение времени реальных внешних запросов к Tinkoff API (сек).
 # Валидация окончательно выполняется перед каждым RPC (validate_timeout).
-_raw_tinkoff_timeout = _env("TINKOFF_TIMEOUT", "")
-if _raw_tinkoff_timeout:
-    try:
-        TINKOFF_TIMEOUT = float(_raw_tinkoff_timeout)
-    except ValueError:
-        raise ImproperlyConfigured(
-            f"TINKOFF_TIMEOUT должно быть конечным положительным числом "
-            f"секунд, получено: {_raw_tinkoff_timeout!r}"
-        )
-else:
-    TINKOFF_TIMEOUT = 30.0
+_raw_tinkoff_timeout = _env("TINKOFF_TIMEOUT", "") or "30"
+try:
+    TINKOFF_TIMEOUT = float(_raw_tinkoff_timeout)
+except ValueError:
+    raise ImproperlyConfigured(
+        f"TINKOFF_TIMEOUT должно быть конечным положительным числом "
+        f"секунд, получено: {_raw_tinkoff_timeout!r}"
+    )
+
+# --- История цен (группа 3, FEATURES.md) ---
+# Источник цен для накопления истории: "tinkoff" (реальный API, нужен
+# TINKOFF_TOKEN) или "demo" (ЯВНО включаемый синтетический режим для
+# демонстрации без токена; данные помечаются источником в БД и
+# "демонстрационными" в интерфейсе). Неизвестное значение — ошибка
+# конфигурации, а не молчаливый fallback.
+PRICE_SOURCE = _env("PRICE_SOURCE", "tinkoff").lower()
+if PRICE_SOURCE not in ("tinkoff", "demo"):
+    raise ImproperlyConfigured(
+        f"PRICE_SOURCE должно быть 'tinkoff' или 'demo', получено: "
+        f"{PRICE_SOURCE!r}"
+    )
+
+# Интервал локального коллектора цен (management command collect_prices),
+# секунд; допустимы только конечные положительные значения (пустое значение
+# окружения считается не заданным — берётся умолчание).
+_raw_price_interval = _env("PRICE_COLLECT_INTERVAL", "") or "10"
+try:
+    PRICE_COLLECT_INTERVAL = float(_raw_price_interval)
+except ValueError:
+    raise ImproperlyConfigured(
+        f"PRICE_COLLECT_INTERVAL должно быть конечным положительным числом "
+        f"секунд, получено: {_raw_price_interval!r}"
+    ) from None
+if (
+    PRICE_COLLECT_INTERVAL <= 0
+    or PRICE_COLLECT_INTERVAL != PRICE_COLLECT_INTERVAL
+    or PRICE_COLLECT_INTERVAL in (float("inf"), float("-inf"))
+):
+    raise ImproperlyConfigured(
+        f"PRICE_COLLECT_INTERVAL должно быть конечным положительным числом "
+        f"секунд, получено: {_raw_price_interval!r}"
+    )
 
 # --- Celery ---
 CELERY_TIMEZONE = TIME_ZONE

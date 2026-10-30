@@ -1,0 +1,122 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}
+<title>История цен: {{ share.ticker }}</title>
+{% endblock %}
+
+{% block content %}
+    <div class="row">
+    <div class="col3"></div>
+    <div class="col6">
+        <h3>История цен: {{ share.name }} ({{ share.ticker }})</h3>
+
+        {% if integration_note %}
+            <div class="alert alert-info mt-2">{{ integration_note|safe }}</div>
+        {% endif %}
+
+        <div class="btn-group my-2" role="group">
+            {% for p in periods %}
+                <a class="btn btn-outline-secondary {% if p == period %}active{% endif %}"
+                   href="?period={{ p }}">{{ p }}</a>
+            {% endfor %}
+        </div>
+
+        <p class="mt-2">
+            <a href="{% url 'dashboard:detail' share.id %}">← К карточке инструмента</a>
+        </p>
+
+        {% if series %}
+            {% for item in series %}
+                <div class="card my-2">
+                    <div class="card-body">
+                        <h5 class="mt-0">
+                            Серия: источник {{ item.source }},
+                            валюта {{ item.currency }}
+                        </h5>
+                        {% if item.source_note %}
+                            <div class="alert alert-warning py-1 px-2">
+                                {{ item.source_note }}
+                            </div>
+                        {% endif %}
+                        <dl class="row mb-2">
+                            <dt class="col-sm-4">Наблюдений за период</dt>
+                            <dd class="col-sm-8">{{ item.summary.count }}</dd>
+
+                            <dt class="col-sm-4">Первое наблюдение</dt>
+                            <dd class="col-sm-8">
+                                {% if item.summary.first %}
+                                    {{ item.summary.first.price_decimal }} {{ item.currency }} — {{ item.summary.first.quote_time }}
+                                {% else %}—{% endif %}
+                            </dd>
+
+                            <dt class="col-sm-4">Последнее наблюдение</dt>
+                            <dd class="col-sm-8">
+                                {% if item.summary.last %}
+                                    {{ item.summary.last.price_decimal }} {{ item.currency }} — {{ item.summary.last.quote_time }}
+                                {% else %}—{% endif %}
+                            </dd>
+
+                            <dt class="col-sm-4">Изменение (абсолютное)</dt>
+                            <dd class="col-sm-8">
+                                {% if item.summary.change_abs is not None %}
+                                    {{ item.summary.change_abs }} {{ item.currency }}
+                                {% else %}— (недостаточно наблюдений){% endif %}
+                            </dd>
+
+                            <dt class="col-sm-4">Изменение (процент)</dt>
+                            <dd class="col-sm-8">
+                                {% if item.summary.change_pct is not None %}
+                                    {{ item.summary.change_pct }} %
+                                {% elif item.summary.zero_first %}
+                                    — (процент не определён: начальная цена нулевая)
+                                {% else %}
+                                    — (недостаточно наблюдений)
+                                {% endif %}
+                            </dd>
+                        </dl>
+
+                        {% if item.graph %}
+                            <h6>График (из накопленных данных):</h6>
+                            {% autoescape off %}{{ item.graph }}{% endautoescape %}
+                        {% else %}
+                            <div class="alert alert-light border">
+                                График недоступен: для построения нужно как минимум два наблюдения (сейчас {{ item.summary.count }}).
+                            </div>
+                        {% endif %}
+
+                        <h6 class="mt-3">Наблюдения (по возрастанию времени котировки)</h6>
+                        <table class="table table-striped">
+                            <thead>
+                            <tr>
+                                <th scope="col">Время котировки</th>
+                                <th scope="col">Цена</th>
+                                <th scope="col">Источник</th>
+                                <th scope="col">Получено</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            {% for obs in item.observations %}
+                                <tr>
+                                    <td>{{ obs.quote_time }}</td>
+                                    <td>{{ obs.price_decimal }}</td>
+                                    <td>
+                                        {% if obs.source == "demo" %}demo (демонстрационные данные){% else %}{{ obs.source }}{% endif %}
+                                    </td>
+                                    <td>{{ obs.received_at }}</td>
+                                </tr>
+                            {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            {% endfor %}
+        {% else %}
+            <div class="alert alert-warning">
+                История цен пока недоступна: наблюдений нет{% if period != "all" %} за выбранный период {{ period }}{% endif %}.
+                Запустите фоновый сбор цен: <code>python manage.py collect_prices</code>
+            </div>
+        {% endif %}
+    </div>
+    <div class="col3"></div>
+    </div>
+{% endblock %}

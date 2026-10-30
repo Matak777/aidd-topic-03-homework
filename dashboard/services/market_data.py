@@ -183,6 +183,18 @@ def money_to_float(quotation) -> float:
     return float(quotation.units) + float(quotation.nano) / 1e9
 
 
+def quotation_to_decimal(quotation) -> "decimal.Decimal":
+    """Quotation (units + nano) → точный Decimal, без float-арифметики.
+
+    Используется для накопления истории цен: запись в БД не должна терять
+    нано-часть; float остаётся только для отрисовки графика."""
+    import decimal
+
+    return decimal.Decimal(quotation.units) + (
+        decimal.Decimal(quotation.nano) / decimal.Decimal("1_000_000_000")
+    )
+
+
 def get_tinkoff_timeout() -> float:
     from config.settings import TINKOFF_TIMEOUT
 
@@ -192,7 +204,7 @@ def get_tinkoff_timeout() -> float:
 def get_last_prices(figi_list, timeout_s: float | None = None) -> dict:
     """Возвращает последнюю цену для списка figi одним gRPC-вызовом.
 
-    Возвращает dict {figi: (price: float, time: datetime)}.
+    Возвращает dict {figi: (price: Decimal — точно, time: datetime)}.
     """
     if not figi_list:
         return {}
@@ -208,7 +220,7 @@ def get_last_prices(figi_list, timeout_s: float | None = None) -> dict:
             for item in resp.last_prices:
                 logger.info(f"Get last data for share figi {item.figi}")
             return {
-                item.figi: (money_to_float(item.price), item.time)
+                item.figi: (quotation_to_decimal(item.price), item.time)
                 for item in resp.last_prices
             }
 
