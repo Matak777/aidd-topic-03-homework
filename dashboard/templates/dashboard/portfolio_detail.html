@@ -1,0 +1,101 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}
+    <title>Портфель {{ portfolio.name }}</title>
+{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <h3>Портфель: {{ portfolio.name }}
+            {% if is_demo %}
+                <span class="badge bg-warning text-dark">DEMO-оценка</span>
+            {% endif %}
+        </h3>
+
+        <div class="btn-group my-2" role="group">
+            <a href="{% url 'dashboard:portfolio-trade-new' portfolio.id %}" class="btn btn-primary">Операция BUY/SELL</a>
+            <a href="{% url 'dashboard:portfolio-journal' portfolio.id %}" class="btn btn-outline-secondary">Журнал</a>
+            <a href="{% url 'dashboard:portfolio-delete' portfolio.id %}" class="btn btn-outline-danger">Удалить портфель</a>
+        </div>
+
+        {# --- Итоги --- #}
+        <h5 class="mt-3">Итоги ({{ summary.base_currency }})</h5>
+        {% if summary.incomplete %}
+            <div class="alert alert-warning">
+                Неполная оценка: у открытых позиций нет подходящих наблюдений
+                выбранного источника ({{ summary.valuation_source }}) — итоги
+                считаются только по оценённым позициям и могут быть занижены.
+                Отсутствующие котировки не подменяются.
+            </div>
+        {% endif %}
+        <table class="table table-sm table-bordered w-auto">
+            <tbody>
+            <tr><th>Стартовый баланс</th><td>{{ shown.initial_cash }}</td></tr>
+            <tr><th>Денежный остаток (cash)</th><td>{{ shown.cash }}</td></tr>
+            <tr>
+                <th>Оценённая стоимость позиций {% if summary.incomplete %}(частично){% endif %}</th>
+                <td>{{ shown.market_value }}</td>
+            </tr>
+            <tr><th>Полная оценка портфеля</th><td>{{ shown.total_value|default_if_none:"— (неполная оценка)" }}</td></tr>
+            <tr><th>Реализованный P/L</th><td>{{ shown.realized_pl }}</td></tr>
+            <tr><th>Нереализованный P/L</th><td>{{ shown.unrealized_pl|default_if_none:"—" }}</td></tr>
+            <tr><th>Совокупный результат</th><td>{{ shown.overall_pl }}</td></tr>
+            <tr>
+                <th>Доходность (к старту)</th>
+                <td>
+                    {% if shown.return_pct is not None %}{{ shown.return_pct }}%{% else %}—{% endif %}
+                </td>
+            </tr>
+            </tbody>
+        </table>
+        <p class="form-text">Источник оценки: <b>{{ summary.valuation_source }}</b>.
+        Округление агрегатов — только для отображения (4 знака); журнал
+        операций остаётся источником истины.</p>
+
+        {# --- Состав (открытые позиции) --- #}
+        <h5 class="mt-4">Состав</h5>
+        {% if cards %}
+            <table class="table table-striped table-sm">
+                <thead>
+                <tr>
+                    <th>Инструмент</th>
+                    <th>Кол-во</th>
+                    <th>Средняя себестоимость</th>
+                    <th>Стоимость покупки</th>
+                    <th>Последний курс ({{ summary.valuation_source }})</th>
+                    <th>Текущая стоимость позиции</th>
+                    <th>Нереализованный P/L</th>
+                </tr>
+                </thead>
+                <tbody>
+                {% for c in cards %}
+                    <tr>
+                        <td>{% if c.share %}<a href="{% url 'dashboard:detail' c.share.id %}">{{ c.ticker }}</a>{% else %}{{ c.figi }} (снимок){% endif %}</td>
+                        <td>{{ c.open_qty_display }}</td>
+                        <td>{{ c.avg_cost_display|default_if_none:"—" }}</td>
+                        <td>{{ c.cost }}</td>
+                        <td>
+                            {% if c.market_quote is not None %}
+                                {{ c.market_quote }}
+                                <span class="form-text">
+                                ({{ c.quote_source }},
+                                {{ c.quote_time|date:"d.m.Y H:i" }} UTC)
+                                {% if c.quote_source == "demo" %}<span class="badge bg-warning text-dark">DEMO</span>{% endif %}
+                                </span>
+                            {% else %}
+                                <span class="badge bg-secondary">без оценки</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ c.market_value|default_if_none:"—" }}</td>
+                        <td>{{ c.unrealized_pl|default_if_none:"—" }}</td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <p class="text-muted">Открытых позиций нет.</p>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

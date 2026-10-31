@@ -92,10 +92,13 @@ class Command(BaseCommand):
         try:
             while True:
                 try:
-                    created, total = price_history.collect_cycle(source)
+                    created, processed = price_history.collect_cycle(source)
+                    # подпись точная: created — реально созданные строки
+                    # (повторная доставка не считается новой записью),
+                    # processed — число обработанных акций.
                     self.stdout.write(
-                        f"  цикл {cycles + 1}: наблюдений записано "
-                        f"{created}, акций в каталоге {total}"
+                        f"  цикл {cycles + 1}: акций обработано "
+                        f"{processed}, новых наблюдений {created}"
                     )
                 except Exception as e:
                     # сбой цикла (сеть, нет токена, API) — журнализация,

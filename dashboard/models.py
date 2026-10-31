@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+from django.conf import settings
 from django.core.validators import RegexValidator
 from django.db import models
 
@@ -44,8 +45,16 @@ class Share(models.Model):
     IDENTITY_FIELDS = ("figi", "uid", "ticker")
 
     def has_price_history(self) -> bool:
-        """Есть ли у акции накопленные наблюдения цены."""
-        return bool(self.pk) and self.price_observations.exists()
+        """Есть ли у акции накопленные наблюдения или портфельные операции.
+
+        Операции портфелей (Trade) тоже привязывают идентичность: у акции,
+        по которой есть виртуальные сделки, смена figi/uid/ticker/валюты
+        переписала бы финансовую историю (снимок обязан совпадать с
+        инструментом) — считаем её «историей» наравне с наблюдениями.
+        """
+        if not self.pk:
+            return False
+        return self.price_observations.exists() or self.trades.exists()
 
     def protected_identity_changes(self, new_values: dict) -> list[str]:
         """Поля идентичности/валюты, которые попытается изменить запись.
@@ -146,3 +155,185 @@ class PriceObservation(models.Model):
 
     def __str__(self):
         return f"{self.share.ticker} {self.price} @ {self.quote_time:%Y-%m-%dT%H:%M:%S}"
+
+
+class ExactAmountField(models.CharField):
+    """Точная десятичная величина (деньги/количество), текст Decimal.
+
+    Причина — см. коммент у PriceObservation.price: NUMERIC-представление
+    на SQLite (аффинность + чтение через float) молча теряет знаки; текст
+    даёт точный roundtrip. Допустимая строка — десятичное число
+    (например, '123.45'); неконечные (NaN/inf) и экспоненциальные записи
+    валидатором запрещены. max_length=49 покрывает максимум политики
+    точности сервиса: 30 цифр целой части + '.' + 18 цифр дробной;
+    фактический допускаемый диапазон (значащие цифры, хвостовые нули
+    не считаются) проверяется в сервисе (см. portfolio_accounting).
+    """
+
+    def __init__(self, verbose_name=None, **kwargs):
+        kwargs.setdefault("max_length", 49)
+        kwargs.setdefault(
+            "validators",
+            [
+                RegexValidator(
+                    regex=r"^-?\d+(\.\d+)?$",
+                    message=(
+                        "Значение должно быть десятичным числом в текстовом "
+                        "представлении (например, '123.45')."
+                    ),
+                )
+            ],
+        )
+        super().__init__(verbose_name=verbose_name, **kwargs)
+
+
+def format_exact(value: Decimal) -> str:
+    """Точная строка Decimal (без экспоненциальной записи)."""
+    return format(value, "f")
+
+
+class Portfolio(models.Model):
+    """Личный виртуальный портфель (этап 2, F2.1).
+
+    Пополнения/вывод/кредит/FX/шорт — вне этапа. Валюта одна, источник
+    оценки выбирается явно при создании; сама модель не меняет его.
+    """
+
+    VALUATION_SOURCE_DEMO = "demo"
+    VALUATION_SOURCE_TINKOFF = "tinkoff"
+    VALUATION_SOURCE_CHOICES = [
+        (
+            VALUATION_SOURCE_DEMO,
+            "Демонстрационный источник (синтетические цены)",
+        ),
+        (VALUATION_SOURCE_TINKOFF, "Tinkoff Invest API"),
+    ]
+
+    user = models.ForeignKey(
+        getattr(settings, "AUTH_USER_MODEL", "auth.User"),
+        on_delete=models.CASCADE,
+        related_name="portfolios",
+        verbose_name="Владелец",
+    )
+    name = models.CharField(max_length=255, verbose_name="Название")
+    base_currency = models.CharField(max_length=20, verbose_name="Валюта портфеля")
+    valuation_source = models.CharField(
+        max_length=20,
+        choices=VALUATION_SOURCE_CHOICES,
+        verbose_name="Источник оценки",
+    )
+    # Точные точные Decimal-тексты (ExactAmountField): и стартовый баланс,
+    # и текущий cash — источник истины для расчётов.
+    initial_cash = ExactAmountField(verbose_name="Стартовый виртуальный баланс")
+    cash = ExactAmountField(verbose_name="Виртуальный денежный остаток")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Виртуальный портфель"
+        verbose_name_plural = "Виртуальные портфели"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "name"],
+                name="unique_portfolio_user_name",
+            )
+        ]
+        ordering = ["created_at"]
+
+    @property
+    def initial_cash_decimal(self) -> Decimal:
+        """Точный стартовый баланс (Decimal из текста, без float)."""
+        return Decimal(self.initial_cash)
+
+    @property
+    def cash_decimal(self) -> Decimal:
+        """Точный текущий остаток (Decimal из текста, без float)."""
+        return Decimal(self.cash)
+
+    def __str__(self):
+        return f"{self.name} ({self.user})"
+
+
+class Trade(models.Model):
+    """Виртуальная операция портфеля — постоянный снимок исполнения.
+
+    Журнал — источник истины: операции не редактируются и не удаляются
+    через доступные интерфейсы. Идентичность инструмента копируется
+    в снимок (figi/ticker/название/валюта), поэтому удаление акции
+    не уничтожает и не переписывает финансовую историю (share —
+    SET_NULL); удаление портфеля с историей запрещено (PROTECT →
+    понятный отказ в HTML, а не 500 и не потеря записей).
+    """
+
+    SIDE_BUY = "BUY"
+    SIDE_SELL = "SELL"
+    SIDE_CHOICES = [(SIDE_BUY, "Покупка (BUY)"), (SIDE_SELL, "Продажа (SELL)")]
+
+    portfolio = models.ForeignKey(
+        Portfolio,
+        on_delete=models.PROTECT,
+        related_name="trades",
+        verbose_name="Портфель",
+    )
+    share = models.ForeignKey(
+        "dashboard.Share",
+        on_delete=models.SET_NULL,
+        related_name="trades",
+        null=True,
+        blank=True,
+        verbose_name="Инструмент (текущий)",
+    )
+    # --- постоянный снимок идентичности на момент исполнения ---
+    figi = models.CharField(max_length=63, verbose_name="FIGI (снимок)")
+    ticker = models.CharField(max_length=31, verbose_name="Тикер (снимок)")
+    share_name = models.CharField(max_length=255, verbose_name="Название (снимок)")
+    share_currency = models.CharField(max_length=20, verbose_name="Валюта инструмента (снимок)")
+    # --- снимок исполнения ---
+    side = models.CharField(
+        max_length=10,
+        choices=SIDE_CHOICES,
+        verbose_name="Сторона",
+    )
+    quantity = ExactAmountField(verbose_name="Количество (> 0)")
+    price = ExactAmountField(verbose_name="Цена исполнения — ручная (> 0)")
+    commission = ExactAmountField(verbose_name="Комиссия (>= 0)")
+    currency = models.CharField(max_length=20, verbose_name="Валюта сделки")
+    note = models.CharField(max_length=255, blank=True, verbose_name="Заметка")
+    executed_at = models.DateTimeField(verbose_name="Время операции")
+    recorded_at = models.DateTimeField(auto_now_add=True)
+    # --- идемпотентность повторной отправки ---
+    idempotency_key = models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        verbose_name="Ключ идемпотентности",
+    )
+    payload_hash = models.CharField(max_length=64, blank=True, default="")
+
+    class Meta:
+        verbose_name = "Виртуальная операция"
+        verbose_name_plural = "Виртуальные операции"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["portfolio", "idempotency_key"],
+                name="unique_trade_portfolio_idempotency_key",
+            )
+        ]
+        # устойчивый порядок: одинаковые времена — по id
+        ordering = ["executed_at", "id"]
+        indexes = [models.Index(fields=["portfolio", "executed_at"])]
+
+    # --- точные Decimal-доступники (текст хранение) ---
+    @property
+    def quantity_decimal(self) -> Decimal:
+        return Decimal(self.quantity)
+
+    @property
+    def price_decimal(self) -> Decimal:
+        return Decimal(self.price)
+
+    @property
+    def commission_decimal(self) -> Decimal:
+        return Decimal(self.commission)
+
+    def __str__(self):
+        return f"{self.side} {self.quantity} {self.ticker} @ {self.price}"

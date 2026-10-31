@@ -1,0 +1,65 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}
+    <title>Мои портфели</title>
+{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <h3>Мои виртуальные портфели</h3>
+
+        <a href="{% url 'dashboard:portfolio-create' %}" class="btn btn-primary my-2">Создать портфель</a>
+
+        {% if page_obj and page_obj.object_list %}
+            <table class="table table-striped">
+                <thead>
+                <tr>
+                    <th>Название</th>
+                    <th>Валюта</th>
+                    <th>Источник оценки</th>
+                    <th>Стартовый баланс</th>
+                    <th>Остаток (cash)</th>
+                    <th></th>
+                </tr>
+                </thead>
+                <tbody>
+                {% for p in object_list %}
+                    <tr>
+                        <td><a href="{% url 'dashboard:portfolio-detail' p.id %}">{{ p.name }}</a></td>
+                        <td>{{ p.base_currency }}</td>
+                        <td>
+                            {{ p.get_valuation_source_display }}
+                            {% if p.valuation_source == "demo" %}
+                                <span class="badge bg-warning text-dark">DEMO</span>
+                            {% endif %}
+                        </td>
+                        <td>{{ p.initial_cash }}</td>
+                        <td>{{ p.cash }}</td>
+                        <td>
+                            <a href="{% url 'dashboard:portfolio-journal' p.id %}" class="btn btn-sm btn-outline-secondary">Журнал</a>
+                        </td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+
+            {% if page_obj.has_other_pages %}
+                <nav>
+                    <ul class="pagination">
+                        {% if page_obj.has_previous %}
+                            <li class="page-item"><a class="page-link" href="?page={{ page_obj.previous_page_number }}">Назад</a></li>
+                        {% endif %}
+                        <li class="page-item disabled"><span class="page-link">{{ page_obj.number }} / {{ page_obj.paginator.num_pages }}</span></li>
+                        {% if page_obj.has_next %}
+                            <li class="page-item"><a class="page-link" href="?page={{ page_obj.next_page_number }}">Вперёд</a></li>
+                        {% endif %}
+                    </ul>
+                </nav>
+            {% endif %}
+        {% else %}
+            <p class="text-muted">Портфелей пока нет. Создайте первый.</p>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

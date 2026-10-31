@@ -1779,16 +1779,1344 @@ class ApplyPricesAtomicityTests(TestCase):
         from dashboard.services import price_history as ph
 
         now = timezone.now()
-        updated = ph.apply_prices(
+        processed, created = ph.apply_prices(
             {SHARE_DICT["figi"]: (Decimal("777.5"), now)},
             [self.share],
             "tinkoff",
             now=now,
         )
-        self.assertEqual(updated, 1)
+        self.assertEqual(processed, 1)
+        self.assertEqual(created, 1)
         self.share.refresh_from_db()
         self.assertEqual(self.share.last_price, 777.5)
         self.assertEqual(self.share.last_price_source, "tinkoff")
         observation = self.share.price_observations.get()
         self.assertEqual(observation.price_decimal, Decimal("777.5"))
         observation.delete()
+
+
+# --- Этап 2: виртуальные портфели ------------------------------------------
+
+from django.conf import settings as dj_settings  # noqa: E402
+
+from dashboard.models import Portfolio, Trade  # noqa: E402
+from dashboard.services.portfolio_accounting import (  # noqa: E402
+    canonical_text_for_stored,
+    compute_positions,
+    display_round,
+    execute_trade,
+    last_suitable_observation,
+    portfolio_summary,
+    position_rows,
+    validate_executed_time,
+    validate_metric,
+)
+
+settings = dj_settings
+
+
+class PortfolioBase(TestCase):
+    """Общая подготовка для тестов виртуальных портфелей."""
+
+    USER_EMAIL = "writer@example.com"
+    USER_PASSWORD = "N00c2_f_k_correct"
+
+    def setUp(self):
+        from dashboard.models import Portfolio
+
+        self.user = get_user_model().objects.create_user(
+            self.USER_EMAIL, self.USER_EMAIL, self.USER_PASSWORD
+        )
+        self.other_user = get_user_model().objects.create_user(
+            "other@example.com", "other@example.com", "N00c2_f_k_correct"
+        )
+        self.share = Share.objects.create(
+            figi="BBG000B9XRY4",
+            isin="US0378331005",
+            name="Apple",
+            ticker="AAPL",
+            currency="USD",
+            uid="a9eb4238-eba9-488c-b102-b6140fd08e38",
+        )
+        self.assertEqual(
+            settings.DATABASES["default"]["ENGINE"],
+            "django.db.backends.sqlite3",
+        )
+
+    def make_portfolio(
+        self,
+        user=None,
+        name="Main",
+        currency="USD",
+        source="demo",
+        initial="1000",
+    ):
+        from dashboard.models import Portfolio
+
+        return Portfolio.objects.create(
+            user=user or self.user,
+            name=name,
+            base_currency=currency,
+            valuation_source=source,
+            initial_cash=initial,
+            cash=initial,
+        )
+
+    def trade(
+        self,
+        portfolio,
+        side,
+        quantity,
+        price,
+        commission="0",
+        minutes=-10,
+        share=None,
+        note="",
+        idempotency_key=None,
+        at=None,
+    ):
+        from django.utils import timezone
+
+        if at is None:
+            at = timezone.now() + timedelta(minutes=minutes)
+        return execute_trade(
+            portfolio,
+            side=side,
+            share=share or self.share,
+            quantity=quantity,
+            price=price,
+            commission=commission,
+            executed_at=at,
+            note=note,
+            idempotency_key=idempotency_key,
+        )
+
+
+from django.conf import settings as dj_settings  # noqa: E402
+
+settings = dj_settings
+
+
+class ControlExampleTests(PortfolioBase):
+    """Контрольный пример из задания (критерий 1)."""
+
+    def setUp(self):
+        super().setUp()
+        self.p = self.make_portfolio()
+        self.trade(self.p, "BUY", "2", "100", commission="2", minutes=-30)
+        self.trade(self.p, "BUY", "3", "120", commission="3", minutes=-20)
+        self.trade(self.p, "SELL", "2", "130", commission="2", minutes=-10)
+
+    def positions(self):
+        from dashboard.services.portfolio_accounting import compute_positions
+
+        return compute_positions(self.p)[self.share.figi]
+
+    def test_quantity_and_avg_cost(self):
+        pos = self.positions()
+        self.assertEqual(pos["open_qty"], Decimal("3"))
+        self.assertEqual(pos["avg_cost"], Decimal("113"))
+
+    def test_cash(self):
+        self.p.refresh_from_db()
+        self.assertEqual(self.p.cash_decimal, Decimal("693"))
+
+    def test_realized_pl(self):
+        self.assertEqual(self.positions()["realized_pl"], Decimal("32"))
+
+    def test_valuation_at_125(self):
+        from dashboard.models import PriceObservation
+
+        quote_time = timezone.now()
+        PriceObservation.objects.create(
+            share=self.share,
+            price="125",
+            currency="USD",
+            source="demo",
+            quote_time=quote_time,
+        )
+        obs = last_suitable_observation(
+            self.share, "demo", "USD", as_of=quote_time + timedelta(seconds=1)
+        )
+        self.assertEqual(obs.price_decimal, Decimal("125"))
+        self.p.refresh_from_db()
+        summary = portfolio_summary(
+            self.p, as_of=quote_time + timedelta(seconds=1)
+        )
+        self.assertEqual(summary["unrealized_pl"], Decimal("36"))
+        self.assertEqual(summary["overall_pl"], Decimal("68"))
+        self.assertEqual(summary["total_value"], Decimal("1068"))
+        self.assertEqual(summary["return_pct"].normalize(), Decimal("6.8"))
+        self.assertFalse(summary["incomplete"])
+
+
+class AveragingAndClosingTests(PortfolioBase):
+    """Средняя себестоимость, частичная продажа, полное закрытие."""
+
+    def test_two_buys_weighted_average(self):
+        p = self.make_portfolio(initial="10000")
+        self.trade(p, "BUY", "10", "100", minutes=-20)
+        self.trade(p, "BUY", "10", "110", minutes=-10)
+        pos = compute_positions(p)[self.share.figi]
+        self.assertEqual(pos["open_qty"], Decimal("20"))
+        self.assertEqual(pos["avg_cost"], Decimal("105"))
+
+    def test_partial_sell_keeps_average(self):
+        p = self.make_portfolio(initial="10000")
+        self.trade(p, "BUY", "10", "100", minutes=-20)
+        res = self.trade(p, "SELL", "4", "90", commission="1", minutes=-5)
+        pos = compute_positions(p)[self.share.figi]
+        self.assertEqual(pos["open_qty"], Decimal("6"))
+        self.assertEqual(pos["avg_cost"], Decimal("100"))
+        # реализованный P/L: 4*90 - 1 - 4*100 = -41
+        self.assertEqual(pos["realized_pl"], Decimal("-41"))
+
+    def test_full_close_then_new_buy(self):
+        p = self.make_portfolio(initial="1000")
+        self.trade(p, "BUY", "5", "100", commission="0", minutes=-20)
+        self.trade(p, "SELL", "5", "110", commission="0", minutes=-10)
+        positions = compute_positions(p)
+        self.assertEqual(positions[self.share.figi]["open_qty"], Decimal("0"))
+        self.assertIsNone(positions[self.share.figi]["avg_cost"])
+        # новая покупка начинает расчёт с нуля
+        self.trade(p, "BUY", "2", "120", commission="0", minutes=-5)
+        pos = compute_positions(p)[self.share.figi]
+        self.assertEqual(pos["open_qty"], Decimal("2"))
+        self.assertEqual(pos["avg_cost"], Decimal("120"))
+
+
+class RejectionTests(PortfolioBase):
+    """Отказы без частичных изменений (F2.4)."""
+
+    def setUp(self):
+        super().setUp()
+        self.p = self.make_portfolio(initial="100")
+        self.p.refresh_from_db()
+
+    def test_sell_more_than_owned(self):
+        self.trade(self.p, "BUY", "5", "10", minutes=-20)
+        with self.assertRaises(ValueError):
+            self.trade(self.p, "SELL", "6", "10", minutes=-10)
+        self.p.refresh_from_db()
+        self.assertEqual(self.p.cash_decimal, Decimal("50"))
+
+    def test_insufficient_funds(self):
+        with self.assertRaises(ValueError):
+            self.trade(self.p, "BUY", "20", "10", commission="1", minutes=-20)
+        self.p.refresh_from_db()
+        self.assertEqual(self.p.cash_decimal, Decimal("100"))
+        self.assertEqual(self.p.trades.count(), 0)
+
+    def test_currency_mismatch(self):
+        other = Share.objects.create(
+            figi="BBG00EUR1",
+            isin="EUR0001",
+            name="Euro stock",
+            ticker="EUR1",
+            currency="EUR",
+            uid="uid-eur-1",
+        )
+        with self.assertRaises(ValueError):
+            self.trade(self.p, "BUY", "1", "1", minutes=-20, share=other)
+        self.assertEqual(self.p.trades.count(), 0)
+
+    def test_bad_values(self):
+        for kwargs in (
+            {"quantity": "0", "price": "1"},
+            {"quantity": "-1", "price": "1"},
+            {"quantity": "1", "price": "0"},
+            {"quantity": "1", "price": "-5"},
+            {"quantity": "1", "price": "1", "commission": "-0.5"},
+            {"quantity": "abc", "price": "1"},
+            {"quantity": "NaN", "price": "1"},
+            {"quantity": "Infinity", "price": "1"},
+        ):
+            with self.assertRaises(ValueError):
+                self.trade(
+                    self.p,
+                    "BUY",
+                    kwargs["quantity"],
+                    kwargs["price"],
+                    commission=kwargs.get("commission", "0"),
+                    minutes=-20,
+                )
+        self.assertEqual(self.p.trades.count(), 0)
+
+    def test_future_time_rejected(self):
+        with self.assertRaises(ValueError):
+            self.trade(self.p, "BUY", "1", "1", minutes=10)
+        self.assertEqual(self.p.trades.count(), 0)
+
+    def test_time_earlier_than_last_rejected(self):
+        self.trade(self.p, "BUY", "1", "1", minutes=-10)
+        self.p.refresh_from_db()
+        with self.assertRaises(ValueError):
+            self.trade(self.p, "BUY", "1", "1", minutes=-20)
+        self.assertEqual(self.p.trades.count(), 1)
+
+    def test_equal_time_allowed_with_stable_order(self):
+        """Одинаковые времена: операции идут в устойчивом порядке (id)."""
+        at = timezone.now() - timedelta(minutes=10)
+        from dashboard.services.portfolio_accounting import execute_trade
+
+        t1 = execute_trade(
+            self.p,
+            side="BUY",
+            share=self.share,
+            quantity="1",
+            price="10",
+            executed_at=at,
+        )
+        t2 = execute_trade(
+            self.p,
+            side="SELL",
+            share=self.share,
+            quantity="1",
+            price="10",
+            executed_at=at,
+        )
+        names = [t.pk for t in self.p.trades.order_by("executed_at", "id")]
+        self.assertEqual(names, [t1.pk, t2.pk])
+
+
+class IdempotencyAndAtomicityTests(PortfolioBase):
+    """Идемпотентность ключа и атомарность отказа (F2.8)."""
+
+    def setUp(self):
+        super().setUp()
+        self.p = self.make_portfolio(initial="1000")
+
+    def test_same_key_same_data_no_duplicate(self):
+        shared_at = timezone.now() - timedelta(minutes=10)
+        t1 = self.trade(
+            self.p,
+            "BUY",
+            "2",
+            "100",
+            commission="2",
+            idempotency_key="op-1",
+            at=shared_at,
+        )
+        self.p.refresh_from_db()
+        cash_after = self.p.cash_decimal
+        t2 = self.trade(
+            self.p,
+            "BUY",
+            "2",
+            "100",
+            commission="2",
+            idempotency_key="op-1",
+            at=shared_at,
+        )
+        self.assertEqual(t1.pk, t2.pk)
+        self.assertEqual(self.p.trades.count(), 1)
+        self.p.refresh_from_db()
+        self.assertEqual(self.p.cash_decimal, cash_after)
+
+    def test_same_key_different_data_rejected(self):
+        self.trade(
+            self.p,
+            "BUY",
+            "2",
+            "100",
+            commission="2",
+            minutes=-10,
+            idempotency_key="op-1",
+        )
+        with self.assertRaises(ValueError):
+            self.trade(
+                self.p,
+                "BUY",
+                "3",
+                "100",
+                commission="2",
+                minutes=-9,
+                idempotency_key="op-1",
+            )
+        self.assertEqual(self.p.trades.count(), 1)
+
+    def test_atomic_failure_no_partial_changes(self):
+        """Сбой записи операции не оставляет списанных денег."""
+        from dashboard.models import Trade
+        from dashboard.services.portfolio_accounting import execute_trade
+
+        with patch.object(
+            Trade.objects, "create", side_effect=RuntimeError("db failure")
+        ):
+            at = timezone.now() - timedelta(minutes=5)
+            with self.assertRaises(ValueError):
+                execute_trade(
+                    self.p,
+                    side="BUY",
+                    share=self.share,
+                    quantity="2",
+                    price="100",
+                    commission="2",
+                    executed_at=at,
+                )
+        self.p.refresh_from_db()
+        self.assertEqual(self.p.cash_decimal, Decimal("1000"))
+        self.assertEqual(self.p.trades.count(), 0)
+
+
+class ExactRoundtripPortfolioTests(PortfolioBase):
+    """Точный roundtrip SQLite (критерий 6).
+
+    Политика точности: значения для хранения — до 30 целых и 18
+    дробных цифр (текст ≤ 48 символов); вычисления — в широком
+    контексте (120 цифр), накопленный cash — точный.
+    """
+
+    def test_many_digit_values_roundtrip(self):
+        initial = "23456789012345678901234567890.12345678"
+        p = self.make_portfolio(initial=initial)
+        qty = "987654321098765.4321"
+        price = "23.98765432109876"
+        comm = "0.000000000000000015"
+        self.trade(p, "BUY", qty, price, commission=comm, minutes=-10)
+        p.refresh_from_db()
+        tr = p.trades.get()
+        # значения журнала — канонические тексты введённых величин
+        self.assertEqual(tr.quantity, qty)
+        self.assertEqual(tr.price, price)
+        self.assertEqual(tr.commission, comm)
+        # накопленный cash — точный результат.
+        # Эталон считается в независимом контексте (80 цифр, покрывает
+        # все длины этого примера) и дополняется литеральной сверкой
+        # существенных разрядов, чтобы потерю округления было видно.
+        from decimal import localcontext
+
+        with localcontext() as ctx:
+            ctx.prec = 80
+            expected = (
+                Decimal(initial)
+                - Decimal(qty) * Decimal(price)
+                - Decimal(comm)
+            )
+        self.assertEqual(p.cash_decimal, expected)
+        self.assertEqual(str(p.cash_decimal), str(expected))
+        reread = type(p).objects.get(id=p.id)
+        self.assertEqual(str(reread.cash), str(p.cash))
+
+
+class JournalAndValuationTests(PortfolioBase):
+    """Журнал, пагинация, оценка, снимок идентичности (F2.6/F2.7)."""
+
+    def setUp(self):
+        super().setUp()
+        self.p = self.make_portfolio(initial="10000")
+
+    def _mk_obs(
+        self, price, quote_time=None, source="demo", currency="USD", share=None
+    ):
+        return PriceObservation.objects.create(
+            share=share or self.share,
+            price=price,
+            currency=currency,
+            source=source,
+            quote_time=quote_time or timezone.now(),
+        )
+
+    def test_journal_pagination(self):
+        for i in range(25):
+            self.trade(self.p, "BUY", "1", "1", minutes=-(1000 - i))
+        self.client.force_login(self.user)
+        url = reverse("dashboard:portfolio-journal", args=[self.p.pk])
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        # первая страница: 20 записей
+        count = r.context["page_obj"].object_list.count()
+        self.assertEqual(count, 20)
+        r2 = self.client.get(url + "?page=2")
+        self.assertEqual(r2.context["page_obj"].object_list.count(), 5)
+
+    def test_missing_quote_marks_incomplete(self):
+        self.trade(self.p, "BUY", "2", "10", minutes=-10)
+        # наблюдений нет вовсе
+        self.p.refresh_from_db()
+        summary = portfolio_summary(self.p)
+        self.assertTrue(summary["incomplete"])
+        self.assertEqual(summary["market_value"], Decimal("0"))
+        self.assertEqual(summary["cash"], Decimal("9980"))
+        self.assertIsNone(summary["unrealized_pl"])
+
+    def test_valuation_source_and_currency_matching_case_insensitive(self):
+        """USD/usd — одна валюта; источник не смешивается."""
+        self.trade(self.p, "BUY", "1", "10", minutes=-10)
+        self.p.refresh_from_db()
+        self._mk_obs("42.5", source="demo", currency="usd")
+        summary = portfolio_summary(self.p)
+        self.assertFalse(summary["incomplete"])
+        self.assertEqual(summary["market_value"], Decimal("42.5"))
+
+    def test_other_source_quote_not_used(self):
+        """Котировка другого источника не подменяет выбранную оценку."""
+        self.trade(self.p, "BUY", "1", "10", minutes=-10)
+        self.p.refresh_from_db()
+        # tinkoff-наблюдение есть, demo (выбранный источник) — нет
+        self._mk_obs("999", source="tinkoff")
+        summary = portfolio_summary(self.p)
+        self.assertTrue(summary["incomplete"])
+
+    def test_future_quote_excluded(self):
+        self.trade(self.p, "BUY", "1", "10", minutes=-10)
+        self.p.refresh_from_db()
+        self._mk_obs("999", quote_time=timezone.now() + timedelta(days=1))
+        summary = portfolio_summary(self.p)
+        self.assertTrue(summary["incomplete"])
+
+    def test_quote_choice_is_deterministic(self):
+        """Выбор котировки детерминирован и устойчив при повторах.
+
+        Дедупликация (share, source, quote_time) не допускает двух
+        наблюдений одного инструмента/источника с равным quote_time;
+        tie-breakers (received_at, id) остаются для устойчивости.
+        """
+        self.trade(self.p, "BUY", "1", "10", minutes=-10)
+        self.p.refresh_from_db()
+        self._mk_obs("11", quote_time=timezone.now() - timedelta(minutes=2))
+        last = self._mk_obs(
+            "12", quote_time=timezone.now() - timedelta(seconds=5)
+        )
+        picked = last_suitable_observation(self.share, "demo", "USD")
+        self.assertEqual(picked.price_decimal, Decimal("12"))
+        self.assertEqual(picked.pk, last.pk)
+        picked_again = last_suitable_observation(self.share, "demo", "USD")
+        self.assertEqual(picked.pk, picked_again.pk)
+        # старая котировка (quote_time позже) не «всплывает»
+        older = self._mk_obs(
+            "9", quote_time=timezone.now() - timedelta(days=1)
+        )
+        self.assertNotEqual(
+            last_suitable_observation(self.share, "demo", "USD").pk, older.pk
+        )
+
+    def test_demo_source_marked_in_templates(self):
+        self.client.force_login(self.user)
+        r = self.client.get(
+            reverse("dashboard:portfolio-detail", args=[self.p.pk])
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "DEMO")
+
+    def test_trade_snapshot_survives_share_delete(self):
+        t = self.trade(
+            self.p, "BUY", "1", "10", minutes=-10, note="память инструментов"
+        )
+        figi, ticker, name, cur = (
+            t.figi,
+            t.ticker,
+            t.share_name,
+            t.share_currency,
+        )
+        self.share.delete()
+        t.refresh_from_db()
+        self.assertIsNone(t.share)
+        self.assertEqual(
+            (t.figi, t.ticker, t.share_name, t.share_currency),
+            (figi, ticker, name, cur),
+        )
+        # журнал доступен без 500
+        self.client.force_login(self.user)
+        r = self.client.get(
+            reverse("dashboard:portfolio-journal", args=[self.p.pk])
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "AAPL")
+
+    def test_portfolio_delete_with_trades_protected(self):
+        self.trade(self.p, "BUY", "1", "10", minutes=-10)
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:portfolio-delete", args=[self.p.pk])
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "нельзя удалить")
+        # журнал сохранился
+        self.assertEqual(self.p.trades.count(), 1)
+
+    def test_portfolio_delete_without_trades_ok(self):
+        p = self.make_portfolio(name="Empty", initial="10")
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:portfolio-delete", args=[p.pk])
+        )
+        self.assertEqual(r.status_code, 302)
+        self.assertFalse(Portfolio.objects.filter(pk=p.pk).exists())
+
+
+class OwnershipAndSecurityTests(PortfolioBase):
+    """Владелец на сервере, CSRF, доступ (F2.9)."""
+
+    def setUp(self):
+        super().setUp()
+        self.p = self.make_portfolio(initial="100")
+        self.detail_url = reverse(
+            "dashboard:portfolio-detail", args=[self.p.pk]
+        )
+        self.journal_url = reverse(
+            "dashboard:portfolio-journal", args=[self.p.pk]
+        )
+        self.trade_url = reverse(
+            "dashboard:portfolio-trade-new", args=[self.p.pk]
+        )
+
+    def test_anonymous_redirects_to_login(self):
+        for url in (self.detail_url, self.journal_url, self.trade_url):
+            r = self.client.get(url)
+            self.assertEqual(r.status_code, 302)
+
+    def test_foreign_portfolio_404(self):
+        self.client.force_login(self.other_user)
+        for url in (self.detail_url, self.journal_url, self.trade_url):
+            self.assertEqual(self.client.get(url).status_code, 404)
+        delete_url = reverse("dashboard:portfolio-delete", args=[self.p.pk])
+        # POST — только на действующие POST-эндпоинты
+        for url in (self.trade_url, delete_url):
+            self.assertEqual(self.client.post(url, {}).status_code, 404)
+
+    def test_post_requires_csrf(self):
+        """POST-форма без CSRF-токена отклоняется (403)."""
+        from django.test import Client
+
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        r = client.post(self.trade_url, {"side": "BUY"})
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(self.p.trades.count(), 0)
+
+    def test_full_http_operation_flow(self):
+        """Живой scenario через клиент: создание портфеля, 2 покупки,
+        продажа, журнал (для HTTP-прогона есть отдельная проверка на
+        реальном сервере; здесь — интеграционная)."""
+        self.client.force_login(self.user)
+        # создание портфеля
+        r = self.client.post(
+            reverse("dashboard:portfolio-create"),
+            {
+                "name": "HTTP Flow",
+                "base_currency": "USD",
+                "valuation_source": "demo",
+                "initial_cash": "1000",
+            },
+        )
+        self.assertEqual(r.status_code, 302)
+        portfolio = Portfolio.objects.get(user=self.user, name="HTTP Flow")
+        self.assertEqual(portfolio.cash, "1000")
+
+        at = timezone.now().strftime("%Y-%m-%d %H:%M")
+
+        def post_trade(qty, price, side, commission):
+            return self.client.post(
+                reverse("dashboard:portfolio-trade-new", args=[portfolio.pk]),
+                {
+                    "share": str(self.share.id),
+                    "side": side,
+                    "quantity": qty,
+                    "price": price,
+                    "commission": commission,
+                    "executed_at": at,
+                    "note": "",
+                },
+            )
+
+        r = post_trade("2", "100", "BUY", "2")
+        self.assertEqual(r.status_code, 302)
+        r = post_trade("3", "120", "BUY", "3")
+        self.assertEqual(r.status_code, 302)
+        r = post_trade("2", "130", "SELL", "2")
+        self.assertEqual(r.status_code, 302)
+        portfolio.refresh_from_db()
+        self.assertEqual(portfolio.cash_decimal, Decimal("693"))
+        # журнал отображает обе покупки и продажу
+        r = self.client.get(
+            reverse("dashboard:portfolio-journal", args=[portfolio.pk])
+        )
+        self.assertContains(r, "AAPL")
+
+    def test_trade_post_invalid_value_is_rejected(self):
+        self.client.force_login(self.user)
+        at = timezone.now().strftime("%Y-%m-%d %H:%M")
+        r = self.client.post(
+            self.trade_url,
+            {
+                "share": str(self.share.id),
+                "side": "BUY",
+                "quantity": "999",  # денег не хватит
+                "price": "100",
+                "commission": "0",
+                "executed_at": at,
+            },
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "недостаточно")
+        self.assertEqual(self.p.trades.count(), 0)
+        self.p.refresh_from_db()
+        self.assertEqual(self.p.cash_decimal, Decimal("100"))
+
+    def test_form_prefills_price_from_observation(self):
+        self._mk_obs_unused = PriceObservation.objects.create(
+            share=self.share,
+            price="123.45",
+            currency="USD",
+            source="demo",
+            quote_time=timezone.now() - timedelta(minutes=5),
+        )
+        self.client.force_login(self.user)
+        r = self.client.get(self.trade_url + f"?share={self.share.id}")
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "123.45")
+        self.assertContains(r, "Demo")
+        self.assertContains(r, "DEMO")
+
+
+class HasPriceHistoryTradesTests(PortfolioBase):
+    """Идентичность акции с операциями защищена (расширение has_price_history)."""
+
+    def test_share_with_trades_protected_identity(self):
+        p = self.make_portfolio(initial="100")
+        self.trade(p, "BUY", "1", "10", minutes=-10)
+        self.share.refresh_from_db()
+        self.assertTrue(self.share.has_price_history())
+        changed = self.share.protected_identity_changes(
+            {
+                "figi": "NEW-FIGI",
+                "uid": "new-uid",
+                "ticker": "NEWTKR",
+                "currency": "EUR",
+            }
+        )
+        self.assertEqual(
+            sorted(changed), ["currency", "figi", "ticker", "uid"]
+        )
+
+
+class ValidateMetricUnitTests(TestCase):
+    """Граничные значения валидации величин."""
+
+    def test_zero_quantity_rejected_zero_commission_ok(self):
+        from dashboard.services.portfolio_accounting import validate_metric
+
+        with self.assertRaises(ValueError):
+            validate_metric("0", positive=True, label="количество")
+        validate_metric("0", positive=False, label="комиссия")
+        with self.assertRaises(ValueError):
+            validate_metric("-0.0", positive=True, label="количество")
+        with self.assertRaises(ValueError):
+            validate_metric("1E+309", positive=True, label="цена")
+        self.assertEqual(
+            validate_metric("0.00000981", positive=True, label="количество"),
+            Decimal("0.00000981"),
+        )
+        with self.assertRaises(ValueError):
+            validate_metric(None, positive=True, label="количество")
+
+    def test_naive_datetime_treated_as_utc(self):
+        import datetime as dt
+
+        from dashboard.services.portfolio_accounting import (
+            validate_executed_time,
+        )
+
+        naive = (timezone.now() - timedelta(minutes=5)).replace(tzinfo=None)
+        t = validate_executed_time(naive)
+        self.assertTrue(timezone.is_aware(t))
+        future = timezone.now() + timedelta(minutes=5)
+        with self.assertRaises(ValueError):
+            validate_executed_time(future)
+
+
+# --- Дополнительные регрессии ревизии этапа 2 ------------------------------
+
+
+class IdempotentRetryAfterLaterOpsTests(PortfolioBase):
+    """Повтор старой операции валиден и после новых (дефект ревизии 1)."""
+
+    def setUp(self):
+        super().setUp()
+        self.p = self.make_portfolio(initial="1000")
+
+    def test_retry_returns_old_trade_even_after_new_ops(self):
+        t1_at = timezone.now() - timedelta(minutes=30)
+        t2_at = timezone.now() - timedelta(minutes=10)
+        t1 = self.trade(
+            self.p,
+            "BUY",
+            "2",
+            "100",
+            commission="2",
+            idempotency_key="op1",
+            at=t1_at,
+        )
+        self.p.refresh_from_db()
+        cash_after = self.p.cash_decimal
+        self.trade(
+            self.p,
+            "BUY",
+            "1",
+            "50",
+            commission="1",
+            idempotency_key="op2",
+            at=t2_at,
+        )
+        self.p.refresh_from_db()
+        cash_before_retry = self.p.cash_decimal
+        # точный повтор op1 (прежние данные и прежний ключ t1)
+        t1_retry = self.trade(
+            self.p,
+            "BUY",
+            "2",
+            "100",
+            commission="2",
+            idempotency_key="op1",
+            at=t1_at,
+        )
+        self.assertEqual(t1_retry.pk, t1.pk)
+        self.p.refresh_from_db()
+        # cash не изменился (не списал дважды и не вернул), журнал тот же
+        self.assertEqual(self.p.cash_decimal, cash_before_retry)
+        self.assertEqual(self.p.trades.count(), 2)
+        ordered = list(
+            self.p.trades.order_by("executed_at", "id").values_list(
+                "id", flat=True
+            )
+        )
+        self.assertEqual(len(ordered), 2)
+        self.assertEqual(ordered[0], t1.pk)  # повтор не создал дубль
+
+    def test_new_key_backdated_still_rejected(self):
+        self.trade(
+            self.p,
+            "BUY",
+            "2",
+            "100",
+            commission="2",
+            idempotency_key="op1",
+            at=timezone.now() - timedelta(minutes=30),
+        )
+        self.trade(
+            self.p,
+            "BUY",
+            "1",
+            "50",
+            commission="1",
+            idempotency_key="op2",
+            at=timezone.now() - timedelta(minutes=10),
+        )
+        self.p.refresh_from_db()
+        with self.assertRaises(ValueError) as ctx:
+            self.trade(
+                self.p,
+                "BUY",
+                "1",
+                "1",
+                commission="0",
+                idempotency_key="op3",
+                at=timezone.now() - timedelta(minutes=25),
+            )
+        self.assertIn("раньше", str(ctx.exception))
+        self.p.refresh_from_db()
+        self.assertEqual(self.p.cash_decimal, Decimal("747"))
+        self.assertEqual(self.p.trades.count(), 2)
+
+    def test_same_key_other_data_still_rejected(self):
+        self.trade(
+            self.p,
+            "BUY",
+            "2",
+            "100",
+            commission="2",
+            idempotency_key="op1",
+            at=timezone.now() - timedelta(minutes=30),
+        )
+        with self.assertRaises(ValueError):
+            self.trade(
+                self.p,
+                "BUY",
+                "2",
+                "100",
+                commission="3",
+                idempotency_key="op1",
+                at=timezone.now() - timedelta(minutes=30),
+            )
+
+
+class LeadingZeroCashTests(PortfolioBase):
+    """Ведущие нули в начальном балансе не блокируют сделки (дефект 2)."""
+
+    def test_form_canonicalizes_initial_cash(self):
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:portfolio-create"),
+            {
+                "name": "Zeros",
+                "base_currency": "USD",
+                "valuation_source": "demo",
+                "initial_cash": "001000",
+            },
+        )
+        self.assertEqual(r.status_code, 302)
+        p = Portfolio.objects.get(user=self.user, name="Zeros")
+        self.assertEqual(p.initial_cash, "1000")
+        self.assertEqual(p.cash, "1000")
+        # первая покупка проходит, cash = 999
+        at = timezone.now().strftime("%Y-%m-%d %H:%M")
+        r = self.client.post(
+            reverse("dashboard:portfolio-trade-new", args=[p.pk]),
+            {
+                "share": str(self.share.id),
+                "side": "BUY",
+                "quantity": "1",
+                "price": "1",
+                "commission": "0",
+                "executed_at": at,
+            },
+        )
+        self.assertEqual(r.status_code, 302)
+        p.refresh_from_db()
+        self.assertEqual(p.cash, "999")
+
+    def test_legacy_noncanonical_cash_still_trades(self):
+        # уже сохранённые неканонические, но корректные тексты работают:
+        # CAS сравнивается с фактическим текстом в БД
+        p = self.make_portfolio(name="Legacy")
+        Portfolio.objects.filter(id=p.id).update(cash="001000")
+        self.trade(p, "BUY", "1", "1", commission="0", minutes=-10)
+        p.refresh_from_db()
+        self.assertEqual(p.cash, "999")
+
+
+class PrecisionPolicyTests(PortfolioBase):
+    """Явная политика точности: молчаливо бесплатных сделок нет (дефект 3)."""
+
+    def test_micro_trade_rejected_before_write(self):
+        p = self.make_portfolio(initial="1000")
+        micro = "0.000000000000000000000001"  # 10^-24
+        with self.assertRaises(ValueError) as ctx:
+            self.trade(p, "BUY", micro, micro, commission="0", minutes=-10)
+        self.assertIn("точност", str(ctx.exception))
+        p.refresh_from_db()
+        self.assertEqual(p.cash, "1000")
+        self.assertEqual(p.trades.count(), 0)
+
+    def test_small_trade_within_policy_is_exact(self):
+        # дельта 10^-8 — в пределах заявленной точности (18 дробных цифр)
+        p = self.make_portfolio(initial="1000")
+        self.trade(p, "BUY", "1", "0.00000001", commission="0", minutes=-10)
+        p.refresh_from_db()
+        self.assertEqual(p.cash_decimal, Decimal("999.99999999"))
+
+    def test_derived_market_value_exact(self):
+        """Производные величины точны (дефект 3б): эталон — независимая
+        арифметика с достаточной точностью, не тот же контекст, что в
+        сервисе. Сценарий — открытая позиция и её ОБЫЧНЫЙ курс;
+        стоимость позиции вычисляется из журнала.
+
+        Величина порядка 10^37 провалила бы 50-значный контекст и
+        «известную» ошибку 4980948001.249809479 — здесь проверяется,
+        что значение соответствует литералу.
+        """
+        p = self.make_portfolio(initial="1000")
+        qty = "12345678901234567890123456789"
+        quote = "1234567890.123456789"
+        # журнальная запись создаётся напрямую (снапшот) — проверяем
+        # именно арифметику производных, не cash-путь
+        Trade.objects.create(
+            portfolio=p,
+            share=self.share,
+            figi=self.share.figi,
+            ticker=self.share.ticker,
+            share_name=self.share.name,
+            share_currency=self.share.currency,
+            side="BUY",
+            quantity=qty,
+            price="100",
+            commission="0",
+            currency="USD",
+            executed_at=timezone.now() - timedelta(minutes=10),
+            payload_hash="journal-seed",
+        )
+        PriceObservation.objects.create(
+            share=self.share,
+            price=quote,
+            currency="USD",
+            source="demo",
+            quote_time=timezone.now(),
+        )
+        p.refresh_from_db()
+        rows = position_rows(p)
+        card = rows["cards"][0]
+        # точное значение (литерал из задания)
+        expected = Decimal("15241578753238836750342935775019051998.750190521")
+        self.assertEqual(card["market_value"], expected)
+        # эталон независимо умножением в отдельном контексте
+        from decimal import localcontext as _lc
+
+        with _lc() as ref:
+            ref.prec = 80  # покрывает все длины (47 значащих цифр)
+            self.assertEqual(Decimal(qty) * Decimal(quote), expected)
+        # и стоимость позиции не повторяет котировку (раньше был дефект)
+        self.assertNotEqual(card["market_value"], Decimal(quote))
+
+    def test_position_market_value_column(self):
+        """Текущая стоимость позиции = количество × котировка (дефект 4)."""
+        p = self.make_portfolio(initial="1000")
+        self.trade(p, "BUY", "3", "100", commission="0", minutes=-10)
+        PriceObservation.objects.create(
+            share=self.share,
+            price="125",
+            currency="USD",
+            source="demo",
+            quote_time=timezone.now(),
+        )
+        p.refresh_from_db()
+        self.client.force_login(self.user)
+        r = self.client.get(reverse("dashboard:portfolio-detail", args=[p.pk]))
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "125.0000")  # котировка
+        self.assertContains(r, "375.0000")  # 3 × 125
+
+
+class IncompleteTotalsTests(PortfolioBase):
+    """Честные итоги при неполной оценке (дефект 5)."""
+
+    def test_total_unknown_without_quote(self):
+        p = self.make_portfolio(initial="1000")
+        self.trade(p, "BUY", "3", "100", commission="0", minutes=-10)
+        p.refresh_from_db()
+        summary = portfolio_summary(p)
+        self.assertTrue(summary["incomplete"])
+        self.assertIsNone(summary["total_value"])
+        self.assertIsNone(summary["unrealized_pl"])
+        self.assertIsNone(summary["overall_pl"])
+        self.assertIsNone(summary["return_pct"])
+        # известные части остаются
+        self.assertEqual(summary["cash"], Decimal("700"))
+        self.assertEqual(summary["market_value"], Decimal("0"))
+
+    def test_http_shows_dash_for_total(self):
+        p = self.make_portfolio(initial="1000")
+        self.trade(p, "BUY", "3", "100", commission="0", minutes=-10)
+        p.refresh_from_db()
+        self.client.force_login(self.user)
+        r = self.client.get(reverse("dashboard:portfolio-detail", args=[p.pk]))
+        self.assertContains(r, "— (неполная оценка)")
+        self.assertContains(r, "700.0000")  # известный cash
+
+    def test_empty_portfolio_fully_valued(self):
+        p = self.make_portfolio(initial="1000")
+        summary = portfolio_summary(p)
+        self.assertFalse(summary["incomplete"])
+        self.assertEqual(summary["total_value"], Decimal("1000"))
+
+
+class PortfolioNameDuplicatesTests(PortfolioBase):
+    """Повтор названия — понятная ошибка формы, не 500 (дефект 6)."""
+
+    def test_duplicate_name_same_owner_form_error(self):
+        self.make_portfolio(name="Alpha")
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:portfolio-create"),
+            {
+                "name": "Alpha",
+                "base_currency": "USD",
+                "valuation_source": "demo",
+                "initial_cash": "100",
+            },
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "таким названием")
+        self.assertEqual(Portfolio.objects.filter(user=self.user).count(), 1)
+
+    def test_same_name_other_owner_allowed(self):
+        self.make_portfolio(name="Alpha")
+        self.client.force_login(self.other_user)
+        r = self.client.post(
+            reverse("dashboard:portfolio-create"),
+            {
+                "name": "Alpha",
+                "base_currency": "USD",
+                "valuation_source": "demo",
+                "initial_cash": "100",
+            },
+        )
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(Portfolio.objects.filter(name="Alpha").count(), 2)
+
+
+class TradeFormSourceBadgeTests(PortfolioBase):
+    """Источник оценки фактический и на ошибочных ветках (дефект 7)."""
+
+    def test_tinkoff_form_has_no_demo_badge(self):
+        p = self.make_portfolio(
+            initial="1000", source="tinkoff", name="T-Portfolio"
+        )
+        self.client.force_login(self.user)
+        at = timezone.now().strftime("%Y-%m-%d %H:%M")
+        r = self.client.post(
+            reverse("dashboard:portfolio-trade-new", args=[p.pk]),
+            {
+                "share": str(self.share.id),
+                "side": "BUY",
+                "quantity": "999",  # не пройдёт
+                "price": "100",
+                "commission": "0",
+                "executed_at": at,
+            },
+        )
+        self.assertEqual(r.status_code, 200)
+        # ошибка показана, DEMO-бейдж при tinkoff-источнике отсутствует
+        self.assertNotContains(r, "badge bg-warning text-dark")
+        self.assertNotContains(r, "DEMO")
+        # и на начальном GET тоже
+        r = self.client.get(
+            reverse("dashboard:portfolio-trade-new", args=[p.pk])
+        )
+        self.assertNotContains(r, "DEMO")
+        p.refresh_from_db()
+        self.assertEqual(p.trades.count(), 0)
+
+
+# --- Вторая ревизия: округление средней/хвостовые нули/предел точности ------
+
+
+class AverageCostRoundingTests(PortfolioBase):
+    """Обычные последовательности операций при округлении средней (п.1).
+
+    Средняя себестоимость 301/3 требует округления в контексте
+    производных; денежные суммы и cash остаются точными. Контекст
+    производных не должен наследовать trap Inexact от точного
+    контекста исполнения (иначе вторая покупка падала decimal.Inexact).
+    """
+
+    def test_second_buy_survives_average_rounding(self):
+        p = self.make_portfolio(initial="1000")
+        self.trade(p, "BUY", "3", "100", commission="1", minutes=-30)
+        p.refresh_from_db()
+        self.assertEqual(p.cash, "699")
+        # вторая покупка не падает decimal.Inexact
+        self.trade(p, "BUY", "1", "1", commission="0", minutes=-20)
+        p.refresh_from_db()
+        # cash точен: 699 - 1
+        self.assertEqual(p.cash, "698")
+        pos = compute_positions(p)[self.share.figi]
+        self.assertEqual(pos["open_qty"], Decimal("4"))
+        # средняя (302/4) включая комиссию первой покупки
+        self.assertEqual(display_round(pos["avg_cost"]), Decimal("75.5000"))
+        self.assertEqual(
+            display_round(pos["open_qty"] * pos["avg_cost"]),
+            Decimal("302.0000"),
+        )
+
+    def test_partial_full_sell_and_new_buy(self):
+        p = self.make_portfolio(initial="1000")
+        self.trade(p, "BUY", "3", "100", commission="1", minutes=-40)
+        self.trade(p, "BUY", "1", "1", commission="0", minutes=-30)
+        # частичная продажа
+        self.trade(p, "SELL", "2", "130", commission="2", minutes=-20)
+        p.refresh_from_db()
+        # 698 + 2*130 - 2
+        self.assertEqual(p.cash, "956")
+        pos = compute_positions(p)[self.share.figi]
+        self.assertEqual(pos["open_qty"], Decimal("2"))
+        # реализованный P/L: 258 - 2*avg(≈75.5)
+        self.assertEqual(
+            display_round(pos["realized_pl"]), Decimal("107.0000")
+        )
+        # полная продажа
+        self.trade(p, "SELL", "2", "80", commission="1", minutes=-10)
+        p.refresh_from_db()
+        self.assertEqual(p.cash, "1115")
+        pos = compute_positions(p)[self.share.figi]
+        self.assertEqual(pos["open_qty"], Decimal("0"))
+        self.assertIsNone(pos["avg_cost"])
+        # новая покупка после закрытия
+        self.trade(p, "BUY", "5", "50", commission="2", minutes=-5)
+        p.refresh_from_db()
+        self.assertEqual(p.cash, "863")
+        pos = compute_positions(p)[self.share.figi]
+        self.assertEqual(pos["open_qty"], Decimal("5"))
+        # (250 + 2) / 5 — новая средняя с новой комиссией
+        self.assertEqual(display_round(pos["avg_cost"]), Decimal("50.4000"))
+
+
+class TrailingZerosCanonicalizationTests(PortfolioBase):
+    """Допустимые хвостовые нули не дают ложного отказа (п.2)."""
+
+    def test_trailing_zero_input_accepts_exact(self):
+        p = self.make_portfolio(initial="1000")
+        self.trade(
+            p,
+            "BUY",
+            "1.000000000000000000",
+            "1.000000000000000000",
+            commission="0",
+            minutes=-10,
+        )
+        p.refresh_from_db()
+        self.assertEqual(p.cash, "999")
+        tr = p.trades.get()
+        # журнал — канонический текст (хвостовые нули сняты)
+        self.assertEqual(tr.quantity, "1")
+        self.assertEqual(tr.price, "1")
+
+    def test_retry_after_db_read_idempotent(self):
+        p = self.make_portfolio(initial="1000")
+        t1 = self.trade(
+            p,
+            "BUY",
+            "1.000000000000000000",
+            "1.000000000000000000",
+            commission="0",
+            minutes=-10,
+            idempotency_key="tz1",
+        )
+        p.refresh_from_db()
+        # повтор со свежим объектом из БД, тем же executed_at прежней
+        # операции (payload включает время) и текстом без хвостовых нулей
+        fresh = Portfolio.objects.get(id=p.id)
+        t2 = self.trade(
+            fresh,
+            "BUY",
+            "1",
+            "1",
+            commission="0",
+            idempotency_key="tz1",
+            at=t1.executed_at,
+        )
+        self.assertEqual(t2.pk, t1.pk)
+        p.refresh_from_db()
+        self.assertEqual(p.cash, "999")
+        self.assertEqual(p.trades.count(), 1)
+
+    def test_canonicalization_independent_of_decimal_context(self):
+        # специально: normalize() в стандартном контексте 28 округлил бы
+        # большие точные значения; канонизация сервиса — строковая,
+        # без округления.
+        from decimal import getcontext, localcontext
+
+        big = Decimal("123456789012345678901234567890.1")
+        self.assertEqual(
+            canonical_text_for_stored(big),
+            "123456789012345678901234567890.1",
+        )
+        with localcontext(getcontext()):
+            getcontext().prec = 28
+            self.assertNotEqual(
+                str(big.normalize()),
+                "123456789012345678901234567890.1",
+            )
+
+    def test_big_exact_values_trade_and_idempotent(self):
+        p = self.make_portfolio(initial="234567890123456789012345678901")
+        t1 = self.trade(
+            p,
+            "BUY",
+            "123456789012345678901234567890.1",
+            "1",
+            commission="0",
+            minutes=-10,
+            idempotency_key="big1",
+        )
+        p.refresh_from_db()
+        # эталон: независимая арифметика с достаточной точностью
+        from decimal import localcontext as _lc
+
+        with _lc() as ref:
+            ref.prec = 80
+            expected_cash = Decimal(
+                "234567890123456789012345678901"
+            ) - Decimal("123456789012345678901234567890.1")
+        self.assertEqual(p.cash_decimal, expected_cash)
+        self.assertEqual(p.cash, "111111101111111110111111111010.9")
+        tr = p.trades.get()
+        self.assertEqual(tr.quantity, "123456789012345678901234567890.1")
+        # повтор с прежними данными и тем же executed_at (payload
+        # включает время), после чтения из БД — прежняя запись, без
+        # дубля и без изменения cash
+        fresh = Portfolio.objects.get(id=p.id)
+        t2 = self.trade(
+            fresh,
+            "BUY",
+            "123456789012345678901234567890.1",
+            "1",
+            commission="0",
+            idempotency_key="big1",
+            at=t1.executed_at,
+        )
+        self.assertEqual(t2.pk, t1.pk)
+        p.refresh_from_db()
+        self.assertEqual(p.trades.count(), 1)
+        self.assertEqual(p.cash_decimal, expected_cash)
+
+
+class PrecisionLimitTests(PortfolioBase):
+    """Заявленный предел 18 дробных знаков проверяется везде (п.3)."""
+
+    def test_service_rejects_1e_minus20_quantity(self):
+        p = self.make_portfolio(initial="1000")
+        with self.assertRaises(ValueError) as ctx:
+            self.trade(
+                p,
+                "BUY",
+                "0.00000000000000000001",
+                "100000000000000000000",
+                commission="0",
+                minutes=-10,
+            )
+        self.assertIn("точности", str(ctx.exception))
+        p.refresh_from_db()
+        # без частичных изменений
+        self.assertEqual(p.cash, "1000")
+        self.assertEqual(p.trades.count(), 0)
+
+    def test_trade_form_rejects_1e_minus20_quantity(self):
+        p = self.make_portfolio(initial="1000")
+        self.client.force_login(self.user)
+        at = timezone.now().strftime("%Y-%m-%d %H:%M")
+        r = self.client.post(
+            reverse("dashboard:portfolio-trade-new", args=[p.pk]),
+            {
+                "share": str(self.share.id),
+                "side": "BUY",
+                "quantity": "0.00000000000000000001",
+                "price": "100000000000000000000",
+                "commission": "0",
+                "executed_at": at,
+            },
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "точности")
+        p.refresh_from_db()
+        self.assertEqual(p.cash, "1000")
+        self.assertEqual(p.trades.count(), 0)
+
+    def test_initial_cash_1e_minus24_rejected_by_form(self):
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:portfolio-create"),
+            {
+                "name": "Tiny",
+                "base_currency": "USD",
+                "valuation_source": "demo",
+                "initial_cash": "0.000000000000000000000001",
+            },
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "точности")
+        self.assertEqual(
+            Portfolio.objects.filter(user=self.user, name="Tiny").count(),
+            0,
+        )
+
+    def test_trailing_zeros_do_not_increase_required_precision(self):
+        # 18 дробных знаков, все — хвостовые нули: допустимо
+        self.trade(
+            self.make_portfolio(initial="1000"),
+            "BUY",
+            "1.000000000000000000",
+            "1",
+            commission="0.000000000000000000",  # тоже хвостовые нули
+            minutes=-10,
+        )

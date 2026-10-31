@@ -136,7 +136,7 @@ def record_observations(price_by_figi, shares, source: str) -> int:
     return created
 
 
-def apply_prices(prices, shares, source: str, now=None) -> int:
+def apply_prices(prices, shares, source: str, now=None) -> tuple:
     """Единый путь получения цены: текущий кеш (Share) + история.
 
     Используется и задачей Celery update_last_price, и локальным
@@ -149,7 +149,9 @@ def apply_prices(prices, shares, source: str, now=None) -> int:
     записи наблюдения откатывается и кеш, иначе текущая цена оказалась бы
     «новой» без соответствующей точки истории. Ошибка поднимается наружу —
     вызывающий решает, логировать и продолжать ли цикл.
-    Возвращает число обновлённых акций.
+
+    Возвращает (обработано акций, создано новых наблюдений): повторная
+    доставка, не создавшая строку, не считается новым наблюдением.
     """
     from django.db import transaction
 
@@ -157,6 +159,7 @@ def apply_prices(prices, shares, source: str, now=None) -> int:
     if now is None:
         now = timezone.now()
     updated = 0
+    created_observations = 0
     for share in shares:
         item = prices.get(share.figi)
         if item is None:
@@ -172,7 +175,7 @@ def apply_prices(prices, shares, source: str, now=None) -> int:
             is_trend_high = last_price > previous
         with transaction.atomic():
             # время котировки — от источника; получателем оно не переписывается
-            record_observations(
+            created_observations += record_observations(
                 {share.figi: (price_exact, quote_time or now)},
                 [share],
                 source,
@@ -184,7 +187,7 @@ def apply_prices(prices, shares, source: str, now=None) -> int:
                 last_price_source=source,
             )
         updated += 1
-    return updated
+    return updated, created_observations
 
 
 # --- Источники цен ---
@@ -242,18 +245,20 @@ def collect_cycle(source: str | None = None, timeout_s=None):
     сторонних механизма не расходятся. Ошибка источника (включая
     отсутствие токена) поднимается наружу — вызывающий цикл
     (management command, Celery, тест) решает, продолжать ли.
-    Возвращает (создано наблюдений, акций в каталоге).
+    Возвращает (создано новых наблюдений, обработано акций); повторная
+    доставка, не создавшая строку, не считается новым наблюдением.
     """
     source = resolve_source(source)
     shares = list(Share.objects.all())
     if not shares:
         return 0, 0
     prices = fetch_prices(source, shares, timeout_s=timeout_s)
-    updated = apply_prices(prices, shares, source)
+    processed, created = apply_prices(prices, shares, source)
     logger.info(
-        f"collect_cycle[{source}]: processed {updated} of {len(shares)}"
+        f"collect_cycle[{source}]: processed {processed} of {len(shares)},"
+        f" new observations {created}"
     )
-    return updated, len(shares)
+    return created, processed
 
 
 # --- История для страницы ---

@@ -29,8 +29,9 @@ def update_last_price():
         logger.error(f"update_last_price: failed to get prices: {e}")
         return
 
-    updated = price_history.apply_prices(prices, shares, source)
+    processed, created = price_history.apply_prices(prices, shares, source)
     logger.info(
-        f"update_last_price: updated {updated} of {len(shares)} shares"
+        f"update_last_price: processed {processed} of {len(shares)} shares,"
+        f" new observations {created}"
     )
-    return updated
+    return processed

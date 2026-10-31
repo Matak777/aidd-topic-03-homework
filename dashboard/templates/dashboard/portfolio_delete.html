@@ -1,0 +1,31 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}
+    <title>Удалить портфель {{ portfolio.name }}</title>
+{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-8">
+        <h3>Удалить портфель «{{ portfolio.name }}»?</h3>
+
+        {% if protected_error %}
+            <div class="alert alert-danger">
+                {{ protected_error }}
+            </div>
+            <a href="{% url 'dashboard:portfolio-detail' portfolio.id %}" class="btn btn-outline-secondary">Вернуться к портфелю</a>
+        {% else %}
+            <div class="alert alert-warning">
+                Портфель с операциями журнала удалить нельзя: финансовая
+                история сохраняется (PROTECT). Без операций — удаление
+                безвозвратно.
+            </div>
+            <form method="post">
+                {% csrf_token %}
+                <button type="submit" class="btn btn-danger">Удалить</button>
+                <a href="{% url 'dashboard:portfolio-detail' portfolio.id %}" class="btn btn-outline-secondary">Отмена</a>
+            </form>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
