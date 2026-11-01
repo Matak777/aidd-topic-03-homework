@@ -13,6 +13,15 @@ from dashboard.views import (
     ShareHistoryView,
     ShareListView,
     ShareUpdateView,
+    WatchlistDetailView,
+    WatchlistListView,
+    WatchNotificationListView,
+    WatchNotificationReadView,
+    WatchNotificationsReadAllView,
+    WatchRuleDeleteView,
+    WatchRuleFormView,
+    WatchRuleListView,
+    WatchRuleToggleView,
 )
 
 app_name = "dashboard"
@@ -51,6 +60,50 @@ urlpatterns = [
         "portfolios/<int:pk>/delete",
         PortfolioDeleteView.as_view(),
         name="portfolio-delete",
+    ),
+    # --- Мониторинг (этап 3). Владелец проверяется на сервере;
+    # изменения только POST с CSRF.
+    path("watch/lists", WatchlistListView.as_view(), name="watchlists"),
+    path(
+        "watch/lists/<int:pk>",
+        WatchlistDetailView.as_view(),
+        name="watchlist-detail",
+    ),
+    path("watch/rules", WatchRuleListView.as_view(), name="watch-rules"),
+    path(
+        "watch/rules/create",
+        WatchRuleFormView.as_view(),
+        name="watch-rule-create",
+    ),
+    path(
+        "watch/rules/<int:pk>/edit",
+        WatchRuleFormView.as_view(),
+        name="watch-rule-edit",
+    ),
+    path(
+        "watch/rules/<int:pk>/toggle",
+        WatchRuleToggleView.as_view(),
+        name="watch-rule-toggle",
+    ),
+    path(
+        "watch/rules/<int:pk>/delete",
+        WatchRuleDeleteView.as_view(),
+        name="watch-rule-delete",
+    ),
+    path(
+        "watch/notifications/read-all",
+        WatchNotificationsReadAllView.as_view(),
+        name="watch-notifications-read-all",
+    ),
+    path(
+        "watch/notifications",
+        WatchNotificationListView.as_view(),
+        name="watch-notifications",
+    ),
+    path(
+        "watch/notifications/<int:pk>/read",
+        WatchNotificationReadView.as_view(),
+        name="watch-notification-read",
     ),
     path("api/", include("dashboard.api.urls")),
 ]

@@ -92,6 +92,10 @@ class PriceObservation(models.Model):
 
     SOURCE_TINKOFF = "tinkoff"
     SOURCE_DEMO = "demo"
+    SOURCE_CHOICES = [
+        (SOURCE_TINKOFF, "Tinkoff Invest API"),
+        (SOURCE_DEMO, "Демонстрационные данные"),
+    ]
 
     share = models.ForeignKey(
         Share,
@@ -121,16 +125,13 @@ class PriceObservation(models.Model):
     )
     currency = models.CharField(max_length=20, verbose_name="Валюта")
     source = models.CharField(
-        max_length=20,
-        choices=[
-            (SOURCE_TINKOFF, "Tinkoff Invest API"),
-            (SOURCE_DEMO, "Демонстрационные данные"),
-        ],
+        max_length=20, choices=SOURCE_CHOICES
     )
     quote_time = models.DateTimeField(verbose_name="Время котировки")
     received_at = models.DateTimeField(
         auto_now_add=True, verbose_name="Время получения"
     )
+
 
     class Meta:
         verbose_name = "Наблюдение цены"
@@ -337,3 +338,235 @@ class Trade(models.Model):
 
     def __str__(self):
         return f"{self.side} {self.quantity} {self.ticker} @ {self.price}"
+
+
+# --- Персональный мониторинг (этап 3, группа 1) ----------------------------
+
+
+class Watchlist(models.Model):
+    """Личный именованный список наблюдения (F1.1).
+
+    Виден и изменяем только владельцем; то же имя у другого владельца
+    допустимо (уникальность (user, name)).
+    """
+
+    user = models.ForeignKey(
+        getattr(settings, "AUTH_USER_MODEL", "auth.User"),
+        on_delete=models.CASCADE,
+        related_name="watchlists",
+        verbose_name="Владелец",
+    )
+    name = models.CharField(max_length=255, verbose_name="Название")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Список наблюдения"
+        verbose_name_plural = "Списки наблюдения"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "name"],
+                name="unique_watchlist_user_name",
+            )
+        ]
+        ordering = ["name", "id"]
+
+    def __str__(self):
+        return f"{self.name} ({self.user_id})"
+
+
+class WatchlistItem(models.Model):
+    """Инструмент в списке наблюдения; добавление без дублей (F1.1)."""
+
+    watchlist = models.ForeignKey(
+        Watchlist,
+        on_delete=models.CASCADE,
+        related_name="items",
+        verbose_name="Список",
+    )
+    share = models.ForeignKey(
+        Share,
+        on_delete=models.CASCADE,
+        related_name="watchlist_items",
+        verbose_name="Инструмент",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Инструмент в списке"
+        verbose_name_plural = "Инструменты в списках"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["watchlist", "share"],
+                name="unique_watchlist_item",
+            )
+        ]
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"{self.watchlist.name}: {self.share.ticker}"
+
+
+class WatchRule(models.Model):
+    """Правило мониторинга (F1.2/F1.3): ≥/≤ порога, источник, валюта.
+
+    Оба направления связки — отдельными правилами. Состояние события
+    живёт здесь (armed/triggered) и опирается на курсор обработанных
+    наблюдений (см. dashboard.services.watch_monitor): в БД хранится
+    и оно, и защита от повторов.
+    """
+
+    DIRECTION_GTE = ">="
+    DIRECTION_LTE = "<="
+    DIRECTION_CHOICES = [
+        (DIRECTION_GTE, "Цена ≥ порога"),
+        (DIRECTION_LTE, "Цена ≤ порога"),
+    ]
+    STATE_ARMED = "armed"
+    STATE_TRIGGERED = "triggered"
+    STATE_CHOICES = [
+        (STATE_ARMED, "Ожидает события"),
+        (STATE_TRIGGERED, "Условие выполнено"),
+    ]
+
+    user = models.ForeignKey(
+        getattr(settings, "AUTH_USER_MODEL", "auth.User"),
+        on_delete=models.CASCADE,
+        related_name="watch_rules",
+        verbose_name="Владелец",
+    )
+    share = models.ForeignKey(
+        Share,
+        on_delete=models.CASCADE,
+        related_name="watch_rules",
+        verbose_name="Инструмент",
+    )
+    direction = models.CharField(
+        max_length=2,
+        choices=DIRECTION_CHOICES,
+        verbose_name="Направление",
+    )
+    threshold = ExactAmountField(
+        verbose_name="Порог (> 0)",
+    )
+    source = models.CharField(
+        max_length=20,
+        choices=PriceObservation.SOURCE_CHOICES,
+        verbose_name="Источник оценки",
+    )
+    currency = models.CharField(max_length=20, verbose_name="Валюта")
+    enabled = models.BooleanField(default=True, verbose_name="Включено")
+    state = models.CharField(
+        max_length=16,
+        choices=STATE_CHOICES,
+        default=STATE_ARMED,
+        verbose_name="Состояние",
+    )
+    cursor_id = models.BigIntegerField(
+        default=0,
+        verbose_name="Курсор обработанных наблюдений",
+    )
+    head_quote_time = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="Время последнего применённого состояния",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Правило мониторинга"
+        verbose_name_plural = "Правила мониторинга"
+        # намеренно БЕЗ уникальности по (direction, threshold) и пр.:
+        # повторные события после выхода/входа всегда другое наблюдение —
+        # их запрещено ограничением (см. WatchEvent)
+        indexes = [
+            models.Index(fields=["share", "enabled"]),
+            models.Index(fields=["user", "enabled"]),
+        ]
+        ordering = ["id"]
+
+    def save(self, *args, **kwargs):
+        # валюта сравнивается без регистра (USD/usd — одна валюта);
+        # хранится нормализованной
+        self.currency = (self.currency or "").strip().upper()
+        super().save(*args, **kwargs)
+
+    @property
+    def threshold_decimal(self) -> "Decimal":
+        """Точный Decimal порога из текста (как в наблюдениях)."""
+        from decimal import Decimal as _Decimal
+
+        return _Decimal(self.threshold)
+
+    def __str__(self):
+        return (
+            f"{self.share.ticker} {self.direction} {self.threshold} "
+            f"({self.source}/{self.currency}, {'вкл' if self.enabled else 'откл'})"
+        )
+
+
+class WatchEvent(models.Model):
+    """Уведомление о событии правила (F1.3, этап 3).
+
+    Все сведения хранятся снимком на момент срабатывания: изменение или
+    удаление правила/инструмента/наблюдения не переписывает доставленное
+    уведомление. Дубль исключён уникальностью (правило, наблюдение);
+    повторное событие после выхода/входа — другое наблюдение, оно не
+    запрещено этой уникальностью.
+    """
+
+    user = models.ForeignKey(
+        getattr(settings, "AUTH_USER_MODEL", "auth.User"),
+        on_delete=models.CASCADE,
+        related_name="watch_events",
+        verbose_name="Владелец",
+    )
+    watch_rule = models.ForeignKey(
+        WatchRule,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="events",
+        verbose_name="Правило",
+    )
+    observation = models.ForeignKey(
+        PriceObservation,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="watch_events",
+        verbose_name="Наблюдение",
+    )
+    # снимок для переживания удаления правила/инструмента
+    figi = models.CharField(max_length=32, default="")
+    ticker = models.CharField(max_length=32, default="")
+    share_name = models.CharField(max_length=128, default="")
+    share_currency = models.CharField(max_length=20, default="")
+    direction = models.CharField(max_length=2, choices=WatchRule.DIRECTION_CHOICES)
+    threshold = ExactAmountField()
+    source = models.CharField(max_length=20)
+    currency = models.CharField(max_length=20)
+    observed_price = ExactAmountField(verbose_name="Цена (снимок)")
+    quote_time = models.DateTimeField(verbose_name="Время котировки (снимок)")
+    message = models.CharField(max_length=255, blank=True)
+    detected_at = models.DateTimeField(auto_now_add=True)
+    is_read = models.BooleanField(default=False, verbose_name="Прочитано")
+    read_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Уведомление мониторинга"
+        verbose_name_plural = "Уведомления мониторинга"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["watch_rule", "observation"],
+                name="unique_watch_event_rule_observation",
+            )
+        ]
+        indexes = [models.Index(fields=["user", "-id"])]
+        ordering = ["-id"]
+
+    def is_demo(self) -> bool:
+        return self.source == PriceObservation.SOURCE_DEMO
+
+    def __str__(self):
+        return f"{self.ticker} {self.direction} {self.threshold} @ {self.observed_price}"

@@ -1,0 +1,70 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}
+    <title>{{ watchlist.name }} — список наблюдения</title>
+{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <h3>Список наблюдения: {{ watchlist.name }}</h3>
+
+        {% if error %}
+            <div class="alert alert-warning">{{ error }}</div>
+        {% endif %}
+
+        {% if watchlist.items.all %}
+            <table class="table table-striped">
+                <thead>
+                <tr>
+                    <th>Тикер</th>
+                    <th>Название</th>
+                    <th>Валюта</th>
+                    <th></th>
+                </tr>
+                </thead>
+                <tbody>
+                {% for item in watchlist.items.all %}
+                    <tr>
+                        <td><a href="{% url 'dashboard:detail' item.share_id %}">{{ item.share.ticker }}</a></td>
+                        <td>{{ item.share.name }}</td>
+                        <td>{{ item.share.currency }}</td>
+                        <td>
+                            <form method="post" class="d-inline">
+                                {% csrf_token %}
+                                <input type="hidden" name="action" value="share-remove">
+                                <input type="hidden" name="share" value="{{ item.share_id }}">
+                                <button type="submit" class="btn btn-sm btn-outline-danger">Убрать</button>
+                            </form>
+                        </td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <p class="text-muted">Список пуст. Добавьте инструмент из каталога.</p>
+        {% endif %}
+
+        <div class="card my-3">
+            <div class="card-body">
+                <h5 class="card-title">Добавить инструмент</h5>
+                <form method="post" novalidate>
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="share-add">
+                    {{ form.share.errors }}
+                    <div class="mb-2">{{ form.share }}</div>
+                    <button type="submit" class="btn btn-primary">Добавить</button>
+                </form>
+            </div>
+        </div>
+
+        <form method="post" class="d-inline"
+              onsubmit="return confirm('Удалить список наблюдения?');">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="list-delete">
+            <button type="submit" class="btn btn-danger">Удалить список</button>
+        </form>
+        <a href="{% url 'dashboard:watchlists' %}" class="btn btn-outline-secondary">К спискам</a>
+    </div>
+</div>
+{% endblock %}

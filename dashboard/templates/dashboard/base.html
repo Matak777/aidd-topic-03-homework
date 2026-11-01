@@ -33,6 +33,7 @@
             <li><a href="{% url 'dashboard:index' %}" class="nav-link px-2 link-secondary">Главная</a></li>
             {% if user.is_authenticated %}
                 <li><a href="{% url 'dashboard:portfolios' %}" class="nav-link px-2 link-secondary">Портфели</a></li>
+                <li><a href="{% url 'dashboard:watchlists' %}" class="nav-link px-2 link-secondary">Наблюдение</a></li>
             {% endif %}
         </ul>
 

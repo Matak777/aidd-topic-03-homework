@@ -1,6 +1,13 @@
 from django import forms
 
-from .models import Portfolio, Share, Trade
+from .models import (
+    Portfolio,
+    PriceObservation,
+    Share,
+    Trade,
+    Watchlist,
+    WatchRule,
+)
 
 
 class ShareModelForm(forms.ModelForm):
@@ -223,3 +230,132 @@ class TradeOperationForm(forms.Form):
         "не создаст дубль; тот же ключ с другими данными — отказ.",
         widget=forms.TextInput(attrs={"class": "form-control"}),
     )
+
+
+# --- Мониторинг (этап 3) ----------------------------------------------------
+
+
+class WatchlistForm(forms.ModelForm):
+    """Создание личного списка наблюдения (F1.1)."""
+
+    class Meta:
+        model = Watchlist
+        fields = ("name",)
+        widgets = {
+            "name": forms.TextInput(attrs={"class": "form-control"}),
+        }
+
+    def clean_name(self):
+        name = self.cleaned_data["name"].strip()
+        if name:
+            user = getattr(self, "user", None)
+            if (
+                user is not None
+                and Watchlist.objects.filter(user=user, name=name).exists()
+            ):
+                raise forms.ValidationError(
+                    "У вас уже есть список с таким названием."
+                )
+        return name
+
+
+class WatchItemAddForm(forms.Form):
+    """Добавление инструмента в список (без дублей, F1.1)."""
+
+    share = forms.ModelChoiceField(
+        queryset=Share.objects.all(),
+        label="Инструмент",
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
+
+
+class WatchRuleForm(forms.Form):
+    """Правило мониторинга (F1.2): ≥/≤ порога, источник, валюта, вкл/откл.
+
+    Оба направления — отдельными правилами; порог — положительный точный
+    Decimal (общая политика точности этапа 2).
+    """
+
+    share = forms.ModelChoiceField(
+        queryset=Share.objects.all(),
+        label="Инструмент",
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
+    direction = forms.TypedChoiceField(
+        choices=WatchRule.DIRECTION_CHOICES,
+        label="Направление",
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
+    threshold = AmountField(positive=True, label="Порог (> 0)")
+    source = forms.TypedChoiceField(
+        choices=PriceObservation.SOURCE_CHOICES,
+        label="Источник оценки",
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
+    currency = forms.CharField(
+        max_length=20,
+        label="Валюта",
+        help_text="Сравнение без регистра (USD/usd — одна валюта); "
+        "пусто — валюта инструмента.",
+        required=False,
+        widget=forms.TextInput(attrs={"class": "form-control"}),
+    )
+    enabled = forms.BooleanField(
+        label="Включено",
+        required=False,
+        initial=True,
+        widget=forms.CheckboxInput(attrs={"class": "form-check-input"}),
+    )
+
+    def clean_currency(self):
+        cur = (self.cleaned_data.get("currency") or "").strip().upper()
+        return cur
+
+    def clean(self):
+        cleaned = super().clean()
+        # валюта пустой формы — валюта выбранного инструмента
+        share = cleaned.get("share")
+        if share is not None and not cleaned.get("currency"):
+            cleaned["currency"] = (share.currency or "").strip().upper()
+        return cleaned
+
+    def apply_rule(self, user, instance=None):
+        """Создание/редактирование правила + пересчёт базового состояния.
+
+        Создание/редактирование/включение — без уведомлений; актуальная
+        совместимая цена становится исходным состоянием (см. сервис).
+        Отключённое правило не уведомляет.
+        """
+        from .services import watch_monitor
+
+        cleaned = self.cleaned_data
+        threshold = watch_monitor.canonical_amount(
+            cleaned["threshold"], positive=True, label="порог"
+        )
+        if instance is None:
+            rule = WatchRule(
+                user=user,
+                share=cleaned["share"],
+                direction=cleaned["direction"],
+                threshold=threshold,
+                source=cleaned["source"],
+                currency=cleaned["currency"],
+                enabled=bool(cleaned.get("enabled")),
+            )
+            rule.save()
+            # создание: старая история не проигрывается (первое новое
+            # наблюдение уведомляет)
+            watch_monitor.reset_baseline(rule, on_change=False)
+        else:
+            instance.share = cleaned["share"]
+            instance.direction = cleaned["direction"]
+            instance.threshold = threshold
+            instance.source = cleaned["source"]
+            instance.currency = cleaned["currency"]
+            instance.enabled = bool(cleaned.get("enabled"))
+            instance.save()
+            rule = instance
+            # редактирование: актуальная цена — исходное состояние БЕЗ
+            # уведомления; если условие уже выполнено — нужен выход
+            watch_monitor.reset_baseline(rule, on_change=True)
+        return rule

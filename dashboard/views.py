@@ -4,6 +4,7 @@ from django.db import IntegrityError
 from django.http import Http404, HttpResponseServerError
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse_lazy
+from django.utils import timezone
 from django.views.generic import (
     CreateView,
     DeleteView,
@@ -13,7 +14,11 @@ from django.views.generic import (
 )
 
 from .forms import ShareModelForm
-from .models import Portfolio, Share
+from .models import (
+    Portfolio,
+    Share,
+    Watchlist,
+)
 from .services.graph import get_graph
 
 
@@ -468,6 +473,329 @@ class PortfolioTradeCreateView(PortfolioOwnerMixin, View):
                 "is_demo": portfolio.valuation_source == "demo",
             },
         )
+
+
+# --- Мониторинг (этап 3) ----------------------------------------------------
+
+
+def _watch_auth(request):
+    """Аноним → redirect на главную; авторизованный — продолжаем."""
+    if not request.user.is_authenticated:
+        return redirect("dashboard:index")
+    return None
+
+
+class WatchlistListView(View):
+    """Список личных списков наблюдения + создание (F1.1)."""
+
+    template_name = "dashboard/watch_lists.html"
+
+    def _context(self, request, form):
+        from django.db.models import Count
+
+        from .forms import WatchlistForm
+        from .models import Watchlist
+
+        if form is None:
+            form = WatchlistForm()
+        lists = (
+            Watchlist.objects.filter(user=request.user)
+            .annotate(items_count=Count("items"))
+            .order_by("name", "id")
+        )
+        return {
+            "lists": lists,
+            "form": form,
+            "form_user": request.user,
+        }
+
+    def get(self, request):
+        return _watch_auth(request) or render(
+            request, self.template_name, self._context(request, None)
+        )
+
+    def post(self, request):
+        from .forms import WatchlistForm
+        from .models import Watchlist
+
+        guard = _watch_auth(request)
+        if guard:
+            return guard
+        form = WatchlistForm(request.POST)
+        form.user = request.user
+        if form.is_valid():
+            watchlist = form.save(commit=False)
+            watchlist.user = request.user
+            try:
+                watchlist.save()
+            except IntegrityError:
+                # страховка гонки дублей (user, name): понятная ошибка
+                form.add_error(
+                    None, "У вас уже есть список с таким названием."
+                )
+            else:
+                return redirect("dashboard:watchlist-detail", watchlist.pk)
+        return render(
+            request,
+            self.template_name,
+            self._context(request, form),
+        )
+
+
+class WatchlistDetailView(View):
+    """Карточка списка: добавление/удаление инструментов (F1.1)."""
+
+    template_name = "dashboard/watch_list_detail.html"
+
+    def _watchlist(self, request, pk):
+        if not request.user.is_authenticated:
+            return None
+        return get_object_or_404(Watchlist, id=pk, user=request.user)
+
+    def get(self, request, pk):
+        guard = _watch_auth(request)
+        if guard:
+            return guard
+        watchlist = self._watchlist(request, pk)
+        if watchlist is None:
+            return redirect("dashboard:index")
+        from .forms import WatchItemAddForm
+
+        return render(
+            request,
+            self.template_name,
+            {
+                "watchlist": watchlist,
+                "form": WatchItemAddForm(),
+                "error": None,
+            },
+        )
+
+    def post(self, request, pk):
+        guard = _watch_auth(request)
+        if guard:
+            return guard
+        watchlist = self._watchlist(request, pk)
+        if watchlist is None:
+            # чужой или неизвестный список → 404 (без изменений)
+            raise Http404("Список наблюдения не найден")
+        from .forms import WatchItemAddForm
+        from .models import WatchlistItem
+
+        action = request.POST.get("action", "share-add")
+        error = None
+        if action == "share-add":
+            form = WatchItemAddForm(request.POST)
+            if not form.is_valid():
+                error = "Выберите инструмент из каталога."
+            else:
+                share = form.cleaned_data["share"]
+                item, created = WatchlistItem.objects.get_or_create(
+                    watchlist=watchlist, share=share
+                )
+                if created:
+                    # Post/Redirect/Get после успешного изменения
+                    return redirect("dashboard:watchlist-detail", watchlist.pk)
+                # повторное добавление — без дубля и без 500
+                error = f"{share.ticker} уже есть в этом списке " "наблюдения."
+        elif action == "share-remove":
+            # валидация ввода до обращения к БД: некорректный ID
+            # (abc/пусто) — понятное сообщение без изменений и без 500
+            raw = (request.POST.get("share") or "").strip()
+            if not raw.isdigit():
+                error = "Некорректный инструмент для удаления."
+            else:
+                WatchlistItem.objects.filter(
+                    watchlist=watchlist, share_id=int(raw)
+                ).delete()
+                return redirect("dashboard:watchlist-detail", watchlist.pk)
+        elif action == "list-delete":
+            watchlist.delete()
+            return redirect("dashboard:watchlists")
+        else:
+            error = "Неизвестное действие."
+        from .forms import WatchItemAddForm as F
+
+        return render(
+            request,
+            self.template_name,
+            {
+                "watchlist": watchlist,
+                "form": F(),
+                "error": error,
+            },
+        )
+
+
+class WatchRuleListView(View):
+    """Список правил мониторинга; вкл/откл/удаление — POST (F1.2/F1.3)."""
+
+    template_name = "dashboard/watch_rules.html"
+
+    def get(self, request):
+        guard = _watch_auth(request)
+        if guard:
+            return guard
+        from .models import WatchRule
+
+        rules = (
+            WatchRule.objects.filter(user=request.user)
+            .select_related("share")
+            .order_by("id")
+        )
+        return render(request, self.template_name, {"rules": rules})
+
+
+class WatchRuleFormView(View):
+    """Создание/редактирование правила (F1.2). Форма общая."""
+
+    template_name = "dashboard/watch_rule_form.html"
+    instance = None
+
+    def _rule(self, request, pk):
+        from .models import WatchRule
+
+        return get_object_or_404(WatchRule, id=pk, user=request.user)
+
+    def _initial(self, rule):
+        return {
+            "share": rule.share,
+            "direction": rule.direction,
+            "threshold": rule.threshold,
+            "source": rule.source,
+            "currency": rule.currency,
+            "enabled": rule.enabled,
+        }
+
+    def get(self, request, pk=None):
+        guard = _watch_auth(request)
+        if guard:
+            return guard
+        from .forms import WatchRuleForm
+
+        instance = None
+        if pk is not None:
+            instance = self._rule(request, pk)
+            form = WatchRuleForm(initial=self._initial(instance))
+        else:
+            form = WatchRuleForm()
+        return render(
+            request,
+            self.template_name,
+            {"form": form, "rule": instance},
+        )
+
+    def post(self, request, pk=None):
+        from .forms import WatchRuleForm
+
+        guard = _watch_auth(request)
+        if guard:
+            return guard
+        instance = None
+        if pk is not None:
+            instance = self._rule(request, pk)
+        form = WatchRuleForm(request.POST)
+        if not form.is_valid():
+            return render(
+                request,
+                self.template_name,
+                {"form": form, "rule": instance},
+            )
+        form.apply_rule(request.user, instance=instance)
+        return redirect("dashboard:watch-rules")
+
+
+class WatchRuleToggleView(View):
+    """Вкл/откл правила (POST): включение пересчитывает исходное
+    состояние без уведомления; отключённое правило не уведомляет."""
+
+    def post(self, request, pk):
+        guard = _watch_auth(request)
+        if guard:
+            return guard
+        from .models import WatchRule
+        from .services import watch_monitor
+
+        rule = get_object_or_404(WatchRule, id=pk, user=request.user)
+        if not rule.enabled:
+            rule.enabled = True
+            rule.save()
+            # включение: актуальная цена — исходное состояние без
+            # уведомления; если условие выполнено — нужен выход
+            watch_monitor.reset_baseline(rule, on_change=True)
+        else:
+            rule.enabled = False
+            rule.save()
+        return redirect("dashboard:watch-rules")
+
+
+class WatchRuleDeleteView(View):
+    """Удаление правила (POST): сработавшие уведомления переживают его
+    (снимки; SET_NULL), состояние не переписывается."""
+
+    def post(self, request, pk):
+        guard = _watch_auth(request)
+        if guard:
+            return guard
+        from .models import WatchRule
+
+        rule = get_object_or_404(WatchRule, id=pk, user=request.user)
+        rule.delete()
+        return redirect("dashboard:watch-rules")
+
+
+class WatchNotificationListView(View):
+    """Список уведомлений пользователя (F1.3) с DEMO-бейджами."""
+
+    template_name = "dashboard/watch_notifications.html"
+    paginate_by = 50
+
+    def get(self, request):
+        guard = _watch_auth(request)
+        if guard:
+            return guard
+        from .models import WatchEvent
+
+        events = WatchEvent.objects.filter(user=request.user)
+        paginator = Paginator(events, self.paginate_by)
+        page_obj = paginator.get_page(request.GET.get("page"))
+        return render(
+            request,
+            self.template_name,
+            {"page_obj": page_obj},
+        )
+
+
+class WatchNotificationReadView(View):
+    """Отметка уведомления прочитанным (POST, только владелец)."""
+
+    def post(self, request, pk):
+        guard = _watch_auth(request)
+        if guard:
+            return guard
+        from .models import WatchEvent
+
+        event = get_object_or_404(WatchEvent, id=pk, user=request.user)
+        if not event.is_read:
+            event.is_read = True
+            event.read_at = timezone.now()
+            event.save()
+        return redirect("dashboard:watch-notifications")
+
+
+class WatchNotificationsReadAllView(View):
+    """Отметить все непрочитанные уведомления пользователя (POST)."""
+
+    def post(self, request):
+        guard = _watch_auth(request)
+        if guard:
+            return guard
+        from .models import WatchEvent
+
+        WatchEvent.objects.filter(user=request.user, is_read=False).update(
+            is_read=True, read_at=timezone.now()
+        )
+        return redirect("dashboard:watch-notifications")
 
 
 class PortfolioDeleteView(PortfolioOwnerMixin, View):

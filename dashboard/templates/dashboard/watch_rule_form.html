@@ -1,0 +1,44 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}
+    <title>{% if rule %}Редактировать правило{% else %}Новое правило мониторинга{% endif %}</title>
+{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-8">
+        <h3>{% if rule %}Редактировать правило{% else %}Новое правило мониторинга{% endif %}</h3>
+
+        <p class="text-muted">
+            Уведомление создаётся при первом новом наблюдении, удовлетворяющем
+            условию (равенство порогу тоже); пока условие остаётся
+            выполненным, повторов нет — наблюдение вне условия повторно
+            взводит правило. Старая история при сохранении не проигрывается.
+            Оба направления задаются отдельными правилами.
+        </p>
+
+        <form method="post" novalidate>
+            {% csrf_token %}
+            {% if form.non_field_errors %}
+                <div class="alert alert-danger">
+                    {% for e in form.non_field_errors %}<div>{{ e }}</div>{% endfor %}
+                </div>
+            {% endif %}
+
+            {% for field in form %}
+                <div class="mb-3">
+                    <label class="form-label" for="{{ field.id_for_label }}">{{ field.label }}</label>
+                    {{ field }}
+                    {% if field.help_text %}<div class="form-text">{{ field.help_text }}</div>{% endif %}
+                    {% for e in field.errors %}<div class="text-danger">{{ e }}</div>{% endfor %}
+                </div>
+            {% endfor %}
+
+            <button type="submit" class="btn btn-primary">
+                {% if rule %}Сохранить{% else %}Создать правило{% endif %}
+            </button>
+            <a href="{% url 'dashboard:watch-rules' %}" class="btn btn-outline-secondary">Отмена</a>
+        </form>
+    </div>
+</div>
+{% endblock %}

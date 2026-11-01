@@ -3120,3 +3120,1132 @@ class PrecisionLimitTests(PortfolioBase):
             commission="0.000000000000000000",  # тоже хвостовые нули
             minutes=-10,
         )
+
+
+# --- Этап 3: персональный мониторинг акций (группа 1) -----------------------
+
+
+class WatchBase(TestCase):
+    """Общая подготовка тестов мониторинга (этап 3)."""
+
+    def setUp(self):
+        from dashboard.models import Share
+
+        self.user = get_user_model().objects.create_user(
+            "owner@example.com", "owner@example.com", "N00c2_f_k_correct"
+        )
+        self.other = get_user_model().objects.create_user(
+            "other@example.com", "other@example.com", "N00c2_f_k_correct"
+        )
+        self.share = Share.objects.create(
+            figi="BBG000B9XRY4",
+            isin="US0378331005",
+            name="Apple",
+            ticker="AAPL",
+            currency="USD",
+            uid="a9eb4238-eba9-488c-b102-b6140fd08e38",
+        )
+        self.eur_share = Share.objects.create(
+            figi="BBG000BBXRY9",
+            isin="DE0007164600",
+            name="SAP",
+            ticker="SAP",
+            currency="EUR",
+            uid="b9eb4238-eba9-488c-b102-b6140fd08e39",
+        )
+        self.assertEqual(
+            settings.DATABASES["default"]["ENGINE"],
+            "django.db.backends.sqlite3",
+        )
+
+    def make_list(self, name="Home", user=None):
+        from dashboard.models import Watchlist
+
+        return Watchlist.objects.create(user=user or self.user, name=name)
+
+    def add_item(self, watchlist, share):
+        from dashboard.models import WatchlistItem
+
+        WatchlistItem.objects.create(watchlist=watchlist, share=share)
+
+    def make_rule(
+        self,
+        *,
+        user=None,
+        share=None,
+        direction=">=",
+        threshold="100",
+        source="demo",
+        currency="USD",
+        enabled=True,
+        reset=True,
+    ):
+        from dashboard.models import WatchRule
+        from dashboard.services.watch_monitor import reset_baseline
+
+        rule = WatchRule.objects.create(
+            user=user or self.user,
+            share=share or self.share,
+            direction=direction,
+            threshold=threshold,
+            source=source,
+            currency=currency,
+            enabled=enabled,
+        )
+        if reset:
+            reset_baseline(rule)
+        return rule
+
+    def add_obs(
+        self,
+        *,
+        share=None,
+        price="125",
+        source="demo",
+        currency="USD",
+        minutes=-10,
+    ):
+        from django.utils import timezone
+
+        from dashboard.models import PriceObservation
+
+        return PriceObservation.objects.create(
+            share=share or self.share,
+            price=price,
+            currency=currency,
+            source=source,
+            quote_time=timezone.now() + timedelta(minutes=minutes),
+        )
+
+    def process(self, rule):
+        from dashboard.services.watch_monitor import process_rule
+
+        count = process_rule(rule)
+        # process_rule обновляет строку в БД (select_for_update):
+        # освежаем тестовый объект, чтобы state/курсор были актуальны
+        rule.refresh_from_db(fields=["state", "cursor_id", "head_quote_time"])
+        return count
+
+    def events(self, rule):
+        from dashboard.models import WatchEvent
+
+        return list(WatchEvent.objects.filter(watch_rule=rule).order_by("id"))
+
+
+class WatchRuleDirectionTests(WatchBase):
+    """Оба направления и равенство порогу (критерии 3)."""
+
+    def _baseline(self, price, direction, threshold):
+        obs = self.add_obs(price=price)
+        rule = self.make_rule(direction=direction, threshold=threshold)
+        return rule, obs
+
+    def test_gte_equality_satisfies(self):
+        rule = self.make_rule(direction=">=", threshold="100")
+        # равенство порогу удовлетворяет условию
+        self.add_obs(price="100")
+        self.assertEqual(self.process(rule), 1)
+        self.assertEqual(len(self.events(rule)), 1)
+
+    def test_gte_first_new_observation_notifies(self):
+        self.add_obs(price="100")
+        rule = self.make_rule(direction=">=", threshold="100")
+        # первое НОВОЕ наблюдение (даже равное порогу) уведомляет
+        self.add_obs(price="100")
+        self.assertEqual(self.process(rule), 1)
+        events = self.events(rule)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(str(events[0].observed_price), "100")
+        self.assertEqual(events[0].direction, ">=")
+        self.assertEqual(str(events[0].threshold), "100")
+
+    def test_lte_equality_satisfies_and_notifies(self):
+        rule = self.make_rule(direction="<=", threshold="100")
+        # новое совместимое наблюдение равное порогу
+        self.add_obs(price="100")
+        self.assertEqual(self.process(rule), 1)
+        # следующее подходящее — без повтора
+        self.add_obs(price="99.5")
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 1)
+
+    def test_lte_above_threshold_no_event(self):
+        rule = self.make_rule(direction="<=", threshold="100")
+        self.add_obs(price="150")
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(rule.state, "armed")
+
+    def test_gte_below_threshold_no_event(self):
+        rule = self.make_rule(direction=">=", threshold="200")
+        self.add_obs(price="150")
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(rule.state, "armed")
+
+    def test_both_directions_simultaneously(self):
+        # ≥ 100 и ≤ 50 — два отдельных правила по одному инструменту
+        high = self.make_rule(direction=">=", threshold="100")
+        low = self.make_rule(direction="<=", threshold="50")
+        self.add_obs(price="120")
+        self.add_obs(price="40")
+        self.assertEqual(self.process(high), 1)
+        self.assertEqual(self.process(low), 1)
+        self.assertEqual(len(self.events(high)), 1)
+        self.assertEqual(len(self.events(low)), 1)
+
+
+class WatchFirstTriggerNoBackfillTests(WatchBase):
+    """Создание не проигрывает историю; первое новое уведомляет (критерий 4)."""
+
+    def test_old_history_satisfying_still_notifies_on_new_obs(self):
+        # старая последняя цена уже подходящая
+        self.add_obs(price="300", minutes=-60)
+        rule = self.make_rule(direction=">=", threshold="100")
+        # создание: старая история НЕ уведомляет; исходное состояние
+        # armed — первое НОВОЕ совместимое наблюдение уведомляет
+        self.assertEqual(rule.state, "armed")
+        self.assertEqual(rule.cursor_id, 1)
+        self.assertEqual(self.events(rule), [])
+        self.add_obs(price="105", minutes=-1)
+        self.assertEqual(self.process(rule), 1)
+        self.assertEqual(len(self.events(rule)), 1)
+
+    def test_no_data_waits_for_first_observation(self):
+        # данных нет вовсе: правило ждёт первое новое наблюдение
+        rule = self.make_rule(direction=">=", threshold="100")
+        self.assertEqual(rule.state, "armed")
+        self.assertEqual(rule.cursor_id, 0)
+        self.add_obs(price="110")
+        self.assertEqual(self.process(rule), 1)
+
+
+class WatchNoDuplicatesAndRearmTests(WatchBase):
+    """Пока условие выполнено — без повторов; выход перевзводит (критерий 5)."""
+
+    def test_no_duplicates_while_satisfied(self):
+        rule = self.make_rule(direction=">=", threshold="100")
+        for price in ("110", "120", "130"):
+            self.add_obs(price=price)
+        self.assertEqual(self.process(rule), 1)
+        # повторный запуск не дублирует (не только курсор: иUnique-путь)
+        self.assertEqual(self.process(rule), 0)
+        self.add_obs(price="140")
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 1)
+
+    def test_exit_reentry_creates_second_event(self):
+        rule = self.make_rule(direction=">=", threshold="100")
+        self.add_obs(price="110")
+        self.assertEqual(self.process(rule), 1)
+        # наблюдение вне условия повторно взводит
+        self.add_obs(price="90")
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(rule.state, "armed")
+        # следующий вход — новое событие (то же direction/threshold)
+        self.add_obs(price="130")
+        self.assertEqual(self.process(rule), 1)
+        events = self.events(rule)
+        self.assertEqual(len(events), 2)
+        self.assertNotEqual(events[0].id, events[1].id)
+
+    def test_reprocess_same_observation_no_duplicate(self):
+        rule = self.make_rule(direction=">=", threshold="100")
+        obs = self.add_obs(price="150")
+        self.assertEqual(self.process(rule), 1)
+        self.assertEqual(len(self.events(rule)), 1)
+        # повторная проверка полностью обработанного окна — без дублей
+        for _ in range(3):
+            self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 1)
+        # «параллельный обработчик» той же пары: курсор сброшен, но
+        # событие уже существует — unique (rule, observation) даёт
+        # идемпотентный повтор (0 новых), состояние не портится
+        rule.cursor_id = 0
+        rule.state = "armed"
+        rule.save()
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 1)
+        self.assertEqual(rule.state, "triggered")
+
+    def test_preexisting_event_unique_guard(self):
+        # заранее существующее событие (симуляция параллельного
+        # обработчика): повторная обработка не падает и не дублирует
+        rule = self.make_rule(direction=">=", threshold="100")
+        obs = self.add_obs(price="150")
+        # курсор ещё не обработан: окно содержит obs
+        before = len(self.events(rule))
+        self.assertEqual(before, 0)
+        rule.cursor_id = 0
+        rule.state = "armed"
+        rule.head_quote_time = None
+        rule.save()
+        # первый обработчик «успел» создать событие и вызвать state
+        from dashboard.models import WatchEvent
+
+        WatchEvent.objects.create(
+            user=rule.user,
+            watch_rule=rule,
+            observation=obs,
+            figi="BBG000B9XRY4",
+            ticker="AAPL",
+            share_name="Apple",
+            share_currency="USD",
+            direction=">=",
+            threshold="100",
+            source="demo",
+            currency="USD",
+            observed_price="150",
+            quote_time=obs.quote_time,
+            message="...",
+        )
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 1)
+
+
+class WatchEditEnableTests(WatchBase):
+    """Редактирование/включение перестраивают исходное состояние (критерий 6)."""
+
+    def test_edit_rebases_without_notification_and_needs_exit(self):
+        rule = self.make_rule(direction=">=", threshold="90")
+        self.add_obs(price="110")  # условие выполнено → событие
+        self.assertEqual(self.process(rule), 1)
+        self.assertEqual(rule.state, "triggered")
+        # редактирование порога: актуальная цена (110) ≥ 95 — исходное
+        # состояние без уведомления, нужен выход перед новым событием
+        from .forms import WatchRuleForm
+
+        form = WatchRuleForm(
+            data={
+                "share": str(rule.share_id),
+                "direction": ">=",
+                "threshold": "95",
+                "source": "demo",
+                "currency": "USD",
+                "enabled": "on",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        from dashboard.models import WatchRule
+
+        form.apply_rule(self.user, instance=WatchRule.objects.get(id=rule.id))
+        rule = WatchRule.objects.get(id=rule.id)
+        self.assertEqual(str(rule.threshold), "95")
+        self.assertEqual(rule.state, "triggered")
+        self.assertEqual(len(self.events(rule)), 1)
+        # другое подходящее наблюдение — без нового события
+        self.add_obs(price="120")
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 1)
+        # выход (95) и снова вход (100) → новое событие
+        self.add_obs(price="94")
+        self.assertEqual(self.process(rule), 0)
+        self.add_obs(price="100")
+        self.assertEqual(self.process(rule), 1)
+        self.assertEqual(len(self.events(rule)), 2)
+
+    def test_enable_rebases_without_notification(self):
+        rule = self.make_rule(direction=">=", threshold="200")
+        self.add_obs(price="110")  # вне условия событие не создаёт
+        self.assertEqual(self.process(rule), 0)
+        # отключение и включение: актуальная цена не уведомляет
+        rule.enabled = False
+        rule.save()
+        self.add_obs(price="150")
+        self.assertEqual(self.process(rule), 0)
+        rule.enabled = True
+        rule.save()
+        from dashboard.services.watch_monitor import reset_baseline
+
+        reset_baseline(rule)
+        self.assertEqual(rule.state, "armed")  # 150 < 200
+        self.assertEqual(len(self.events(rule)), 0)
+        # включённое правило снова обнаруживает вход
+        self.add_obs(price="250")
+        self.assertEqual(self.process(rule), 1)
+        self.assertEqual(len(self.events(rule)), 1)
+
+    def test_disabled_rule_never_notifies(self):
+        rule = self.make_rule(direction=">=", threshold="100", enabled=False)
+        self.add_obs(price="500")
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 0)
+
+
+class WatchBacklogOrderTests(WatchBase):
+    """Обработка последовательности, порядок, перезапуск (критерий 7)."""
+
+    def test_sequence_processed_not_only_latest(self):
+        rule = self.make_rule(direction=">=", threshold="100")
+        # последовательность: вход, выход, вход — ДВА события
+        self.add_obs(price="150", minutes=-30)
+        self.add_obs(price="80", minutes=-20)
+        self.add_obs(price="160", minutes=-10)
+        self.assertEqual(self.process(rule), 2)
+        events = self.events(rule)
+        self.assertEqual(len(events), 2)
+        # первое событие — по первому входу (150), второе — после выхода
+        self.assertEqual(str(events[0].observed_price), "150")
+        self.assertEqual(str(events[1].observed_price), "160")
+
+    def test_two_entries_without_exit_one_event(self):
+        rule = self.make_rule(direction=">=", threshold="100")
+        self.add_obs(price="120", minutes=-20)
+        self.add_obs(price="130", minutes=-10)
+        self.assertEqual(self.process(rule), 1)
+        self.assertEqual(len(self.events(rule)), 1)
+
+    def test_order_by_quote_time_not_insert_id(self):
+        # Сортировка по времени котировки, а не по id вставки:
+        # более поздняя точка вставлена первой, более ранняя — второй.
+        from django.utils import timezone
+
+        from dashboard.models import PriceObservation
+
+        rule = self.make_rule(direction=">=", threshold="100")
+        later = timezone.now() - timedelta(minutes=2)
+        earlier = timezone.now() - timedelta(minutes=4)
+        PriceObservation.objects.create(
+            share=self.share,
+            price="200",
+            currency="USD",
+            source="demo",
+            quote_time=later,
+        )
+        PriceObservation.objects.create(
+            share=self.share,
+            price="50",
+            currency="USD",
+            source="demo",
+            quote_time=earlier,
+        )
+        # порядок по (время, id): 50 (earlier) → выход; 200 (later) → вход
+        self.assertEqual(self.process(rule), 1)
+        events = self.events(rule)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(str(events[0].observed_price), "200")
+        self.assertEqual(rule.state, "triggered")
+
+    def test_backlog_and_restart_no_duplicates(self):
+        rule = self.make_rule(direction=">=", threshold="100")
+        # backооз накопился ДО активации? Нет: до активации курсор
+        # покрывает каталог — здесь window только новые: добавим и
+        # прогоним дважды (перезапуск процесса = новый вызов)
+        self.add_obs(price="111")
+        self.add_obs(price="222")
+        self.assertEqual(self.process(rule), 1)
+        for _ in range(3):
+            self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 1)
+
+    def test_late_point_does_not_rewind(self):
+        rule = self.make_rule(direction=">=", threshold="100")
+        # голова: t2=150 (executed first, later arrival)
+        self.add_obs(price="150", minutes=-10)
+        self.assertEqual(self.process(rule), 1)  # событие, state triggered
+        # запоздавшая точка со временем РАНЬШЕ головы (price 50) —
+        # не откатывает состояние triggered и не даёт ретро-событие
+        self.add_obs(price="50", minutes=-30)
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(rule.state, "triggered")
+        self.assertEqual(len(self.events(rule)), 1)
+        # следующее свежее наблюдение вне условия законно перевзводит
+        self.add_obs(price="60", minutes=-1)
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(rule.state, "armed")
+
+
+class WatchCompatibilityTests(WatchBase):
+    """Источники/валюты/будущие точки (критерий 8)."""
+
+    def test_currency_case_insensitive_matches(self):
+        rule = self.make_rule(direction=">=", threshold="100", currency="USD")
+        # usd — та же валюта
+        self.add_obs(price="150", currency="usd")
+        self.assertEqual(self.process(rule), 1)
+        self.assertEqual(len(self.events(rule)), 1)
+
+    def test_other_currency_ignored(self):
+        rule = self.make_rule(direction=">=", threshold="100", currency="USD")
+        self.add_obs(price="150", currency="EUR")
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(rule.state, "armed")
+        self.assertEqual(len(self.events(rule)), 0)
+
+    def test_other_source_ignored(self):
+        rule = self.make_rule(direction=">=", threshold="100", source="demo")
+        self.add_obs(price="150", source="tinkoff")
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(rule.state, "armed")
+        self.assertEqual(len(self.events(rule)), 0)
+
+    def test_invalid_price_ignored(self):
+        rule = self.make_rule(direction=">=", threshold="100")
+        self.add_obs(price="not-a-number")
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(rule.state, "armed")
+
+    def test_future_point_ignored_and_does_not_block_later(self):
+        from django.utils import timezone
+
+        rule = self.make_rule(direction=">=", threshold="100")
+        # будущая точка (quote_time позже момента проверки)
+        self.add_obs(price="999", minutes=60)
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(rule.state, "armed")
+        # окно сдвигается; позже валидная точка работает
+        self.add_obs(price="150", minutes=-1)
+        self.assertEqual(self.process(rule), 1)
+
+    def test_rule_share_other_tool_ignored(self):
+        rule = self.make_rule(share=self.share, threshold="100")
+        # наблюдение другого инструмента не попадает в окно правила
+        self.add_obs(share=self.eur_share, price="900")
+        self.assertEqual(self.process(rule), 0)
+
+
+class WatchPrecisionTests(WatchBase):
+    """Точность Decimal после записи/чтения SQLite (критерий 9)."""
+
+    def test_threshold_and_price_exact_roundtrip(self):
+        # 18 целых + 18 дробных — край заявленной политики точности
+        threshold = "123456789012345678.123456789012345678"
+        rule = self.make_rule(direction=">=", threshold=threshold)
+        price = "123456789012345678.123456789012345679"
+        self.add_obs(price=price)
+        self.assertEqual(self.process(rule), 1)
+        event = self.events(rule)[0]
+        # точные тексты пережили запись и чтение SQLite
+        self.assertEqual(event.threshold, threshold)
+        self.assertEqual(event.observed_price, price)
+        self.assertEqual(
+            event.watch_rule.threshold,
+            "123456789012345678.123456789012345678",
+        )
+
+    def test_threshold_form_rejects_non_positive(self):
+        from .forms import WatchRuleForm
+
+        form = WatchRuleForm(
+            data={
+                "share": str(self.share.id),
+                "direction": ">=",
+                "threshold": "0",
+                "source": "demo",
+                "currency": "USD",
+                "enabled": "on",
+            }
+        )
+        self.assertFalse(form.is_valid())
+
+    def test_threshold_lower_precision_value_exact(self):
+        rule = self.make_rule(direction=">=", threshold="100")
+        # цена с хвостовыми нулями: сравнение точное, событие хранит
+        # канонический текст правила и точную цену наблюдения
+        self.add_obs(price="100.000000000000000000")
+        self.assertEqual(self.process(rule), 1)
+        event = self.events(rule)[0]
+        self.assertEqual(event.observed_price, "100.000000000000000000")
+        self.assertEqual(str(event.threshold), "100")
+
+
+class WatchlistTests(WatchBase):
+    """Списки наблюдения: владелец, дубли (критерии 1-2)."""
+
+    def test_same_share_no_duplicate(self):
+        wl = self.make_list()
+        self.add_item(wl, self.share)
+        from dashboard.models import WatchlistItem
+
+        # прямой get_or_create (модель) — без дублей
+        item, created = WatchlistItem.objects.get_or_create(
+            watchlist=wl, share=self.share
+        )
+        self.assertFalse(created)
+        self.assertEqual(WatchlistItem.objects.filter(watchlist=wl).count(), 1)
+
+    def test_http_add_share_duplicate_message_no_500(self):
+        wl = self.make_list()
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:watchlist-detail", args=[wl.pk]),
+            {"action": "share-add", "share": str(self.share.id)},
+        )
+        self.assertEqual(r.status_code, 302)
+        r = self.client.post(
+            reverse("dashboard:watchlist-detail", args=[wl.pk]),
+            {"action": "share-add", "share": str(self.share.id)},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, "уже есть")
+        from dashboard.models import WatchlistItem
+
+        self.assertEqual(WatchlistItem.objects.filter(watchlist=wl).count(), 1)
+
+    def test_duplicate_watchlist_name_form_error(self):
+        self.make_list(name="Alpha")
+        from .forms import WatchlistForm
+
+        form = WatchlistForm(data={"name": "Alpha"})
+        form.user = self.user
+        self.assertFalse(form.is_valid())
+        self.assertIn("таким названием", str(form.errors))
+        # то же имя у другого владельца — допустимо
+        form2 = WatchlistForm(data={"name": "Alpha"})
+        form2.user = self.other
+        self.assertTrue(form2.is_valid(), form2.errors)
+        wl = form2.save(commit=False)
+        wl.user = self.other
+        wl.save()
+        from dashboard.models import Watchlist
+
+        self.assertEqual(Watchlist.objects.filter(name="Alpha").count(), 2)
+
+
+class WatchIntegrationPathsTests(WatchBase):
+    """Общий путь записи: локальный коллектор и Celery-путь без Redis
+    (критерий 10)."""
+
+    def test_apply_prices_triggers_monitoring(self):
+        from dashboard.services.price_history import apply_prices
+
+        rule = self.make_rule(direction=">=", threshold="100")
+        updated, created = apply_prices(
+            {self.share.figi: ("150.000000000000000000", None)},
+            [self.share],
+            "demo",
+        )
+        rule.refresh_from_db(fields=["state", "cursor_id"])
+        self.assertEqual(updated, 1)
+        self.assertEqual(created, 1)
+        # уведомление создано автоматически общим путём записи
+        events = self.events(rule)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            str(events[0].observed_price), "150.000000000000000000"
+        )
+        # повторная доставка той же точки — окно пусто, без дублей
+        updated, created = apply_prices(
+            {self.share.figi: ("160", None)}, [self.share], "demo"
+        )
+        rule.refresh_from_db(fields=["state", "cursor_id"])
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 1)
+        # 160 >= 100: состояние осталось triggered повторов нет;
+        # выход ниже порога перевзводит
+        updated, created = apply_prices(
+            {self.share.figi: ("99", None)}, [self.share], "demo"
+        )
+        rule.refresh_from_db(fields=["state", "cursor_id"])
+        self.assertEqual(rule.state, "armed")
+        self.assertEqual(len(self.events(rule)), 1)
+
+    def test_celery_task_run_inline_without_redis(self):
+        from unittest import mock
+
+        from dashboard import tasks
+        from dashboard.services import price_history
+
+        rule = self.make_rule(direction=">=", threshold="90")
+        self.assertEqual(rule.cursor_id, 0)  # окно пусто до этого
+        with self.settings(PRICE_SOURCE="demo"):
+            with mock.patch.object(
+                price_history,
+                "fetch_prices",
+                return_value={self.share.figi: ("95", None)},
+            ):
+                # задача вызывается консьюденно (без Redis)
+                tasks.update_last_price()
+        rule.refresh_from_db(fields=["state"])
+        events = self.events(rule)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(str(events[0].observed_price), "95")
+
+    def test_failing_rule_does_not_break_cycle(self):
+        from unittest import mock
+
+        from dashboard.models import PriceObservation
+        from dashboard.services import price_history
+
+        rule = self.make_rule(direction=">=", threshold="100")
+        baseline = PriceObservation.objects.count()
+        # поломка обработки правила не валит общий путь записи:
+        # наблюдение записано, цикл продолжается
+        with mock.patch(
+            "dashboard.services.watch_monitor.process_rule",
+            side_effect=RuntimeError("boom"),
+        ):
+            updated, created = price_history.apply_prices(
+                {self.share.figi: ("160", None)}, [self.share], "demo"
+            )
+        self.assertEqual(updated, 1)
+        self.assertEqual(created, 1)
+        self.assertEqual(PriceObservation.objects.count(), baseline + 1)
+        # кеш источника обновлён — цена честно зафиксирована
+        self.share.refresh_from_db()
+        self.assertEqual(self.share.last_price_source, "demo")
+
+
+class WatchOwnershipHttpTests(WatchBase):
+    """Владелец на сервере, аноним, CSRF (критерий 1)."""
+
+    def test_other_users_list_is_404(self):
+        wl = self.make_list(user=self.other)
+        self.client.force_login(self.user)
+        r = self.client.get(
+            reverse("dashboard:watchlist-detail", args=[wl.pk])
+        )
+        self.assertEqual(r.status_code, 404)
+        # чужой POST (подмена связанного объекта) — тоже 404
+        r = self.client.post(
+            reverse("dashboard:watchlist-detail", args=[wl.pk]),
+            {"action": "share-add", "share": str(self.share.id)},
+        )
+        self.assertEqual(r.status_code, 404)
+
+    def test_other_users_event_is_404(self):
+        from dashboard.models import WatchEvent
+
+        rule = self.make_rule(user=self.other)
+        obs = self.add_obs(price="150")
+        event = WatchEvent.objects.create(
+            user=self.other,
+            watch_rule=rule,
+            observation=obs,
+            figi="BBG000B9XRY4",
+            ticker="AAPL",
+            share_name="Apple",
+            share_currency="USD",
+            direction=">=",
+            threshold="100",
+            source="demo",
+            currency="USD",
+            observed_price="150",
+            quote_time=obs.quote_time,
+            message="x",
+        )
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:watch-notification-read", args=[event.pk])
+        )
+        self.assertEqual(r.status_code, 404)
+        event.refresh_from_db()
+        self.assertFalse(event.is_read)
+
+    def test_anonymous_redirects_to_index(self):
+        r = self.client.get(reverse("dashboard:watchlists"))
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(r["Location"], reverse("dashboard:index"))
+        r = self.client.get(reverse("dashboard:watch-rules"))
+        self.assertEqual(r.status_code, 302)
+        r = self.client.get(reverse("dashboard:watch-notifications"))
+        self.assertEqual(r.status_code, 302)
+
+    def test_post_without_csrf_token_is_403(self):
+        import django.test
+
+        wl = self.make_list()  # отчётливый список владельца
+        client = django.test.Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        r = client.post(
+            reverse("dashboard:watchlists"),
+            {"name": "NoToken"},
+        )
+        self.assertEqual(r.status_code, 403)
+        # чтение не меняет данные: список не создался
+        from dashboard.models import Watchlist
+
+        self.assertFalse(Watchlist.objects.filter(name="NoToken").exists())
+
+    def test_owner_rule_edit_toggle_delete_http(self):
+        from dashboard.models import WatchRule
+
+        rule = self.make_rule(direction=">=", threshold="100")
+        self.client.force_login(self.user)
+        # edit
+        r = self.client.post(
+            reverse("dashboard:watch-rule-edit", args=[rule.pk]),
+            {
+                "share": str(self.share.id),
+                "direction": ">=",
+                "threshold": "105",
+                "source": "demo",
+                "currency": "USD",
+                "enabled": "on",
+            },
+        )
+        self.assertEqual(r.status_code, 302)
+        rule.refresh_from_db()
+        self.assertEqual(str(rule.threshold), "105")
+        # toggle off
+        r = self.client.post(
+            reverse("dashboard:watch-rule-toggle", args=[rule.pk])
+        )
+        self.assertEqual(r.status_code, 302)
+        rule.refresh_from_db()
+        self.assertFalse(rule.enabled)
+        # toggle on: актуальная цена 150 >= 105 → triggered без уведомления
+        self.add_obs(price="150")
+        r = self.client.post(
+            reverse("dashboard:watch-rule-toggle", args=[rule.pk])
+        )
+        self.assertEqual(r.status_code, 302)
+        rule.refresh_from_db()
+        self.assertTrue(rule.enabled)
+        self.assertEqual(rule.state, "triggered")
+        self.assertEqual(len(self.events(rule)), 0)
+        # delete
+        r = self.client.post(
+            reverse("dashboard:watch-rule-delete", args=[rule.pk])
+        )
+        self.assertEqual(r.status_code, 302)
+        self.assertFalse(WatchRule.objects.filter(id=rule.id).exists())
+
+    def test_other_users_rule_edit_is_404(self):
+        from dashboard.models import WatchRule
+
+        rule = self.make_rule(user=self.other)
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:watch-rule-delete", args=[rule.pk])
+        )
+        self.assertEqual(r.status_code, 404)
+        self.assertTrue(WatchRule.objects.filter(id=rule.id).exists())
+
+
+class WatchDeletionSafetyTests(WatchBase):
+    """Удаление инструментов/правил без 500 и потери истории
+    (критерий 11)."""
+
+    def test_share_delete_keeps_history_and_events_survive(self):
+        from dashboard.models import Portfolio, Trade, WatchRule
+
+        rule = self.make_rule(direction=">=", threshold="100")
+        self.add_obs(price="150")
+        self.assertEqual(self.process(rule), 1)
+        event = self.events(rule)[0]
+        # портфель и операция по этой акции
+        portfolio = Portfolio.objects.create(
+            user=self.user,
+            name="P",
+            base_currency="USD",
+            valuation_source="demo",
+            initial_cash="1000",
+            cash="1000",
+        )
+        execute_trade(
+            portfolio,
+            side=Trade.SIDE_BUY,
+            share=self.share,
+            quantity="1",
+            price="150",
+            commission="0",
+            executed_at=timezone.now() - timedelta(minutes=5),
+        )
+        share_id = self.share.id
+        self.share.delete()  # каскад: наблюдения/правила/предметы
+        self.assertFalse(Share.objects.filter(id=share_id).exists())
+        # история портфелей и операции сохранены
+        portfolio.refresh_from_db()
+        self.assertEqual(Trade.objects.filter(portfolio=portfolio).count(), 1)
+        # уведомление переживает удаление инструмента (снимок)
+        event.refresh_from_db()
+        self.assertEqual(str(event.observed_price), "150")
+        self.assertEqual(event.ticker, "AAPL")
+        self.assertIsNone(event.observation)
+        # чужие правила других владельцев не затронуты
+        self.assertEqual(WatchRule.objects.filter(user=self.other).count(), 0)
+
+    def test_event_survives_rule_delete(self):
+        rule = self.make_rule(direction=">=", threshold="100")
+        self.add_obs(price="150")
+        self.assertEqual(self.process(rule), 1)
+        event_id = self.events(rule)[0].id
+        rule.delete()
+        from dashboard.models import WatchEvent
+
+        event = WatchEvent.objects.get(id=event_id)
+        self.assertIsNone(event.watch_rule)
+        self.assertEqual(str(event.observed_price), "150")
+        self.assertEqual(str(event.threshold), "100")
+
+    def test_mark_read_idempotent(self):
+        rule = self.make_rule(direction=">=", threshold="100")
+        self.add_obs(price="150")
+        self.assertEqual(self.process(rule), 1)
+        event = self.events(rule)[0]
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:watch-notification-read", args=[event.pk])
+        )
+        self.assertEqual(r.status_code, 302)
+        event.refresh_from_db()
+        self.assertTrue(event.is_read)
+        first_read_at = event.read_at
+        # повторная отметка — идемпотентна, время не перезаписывается
+        self.client.post(
+            reverse("dashboard:watch-notification-read", args=[event.pk])
+        )
+        event.refresh_from_db()
+        self.assertEqual(event.read_at, first_read_at)
+        # отметить все
+        r = self.client.post(reverse("dashboard:watch-notifications-read-all"))
+        self.assertEqual(r.status_code, 302)
+
+
+class WatchDbErrorRollbackTests(WatchBase):
+    """Дефект приёмки 1: ошибка записи события не теряет уведомление.
+
+    IntegrityError считается дублем ТОЛЬКО после подтверждения
+    существующей пары (rule, observation); настоящий сбой записи
+    (реальный SQLite BEFORE INSERT trigger) откатывает всю попытку
+    обработки правила: состояние/курсор остаются ДО окна — после
+    устранения ошибки повторная обработка создаёт событие ровно раз.
+    """
+
+    TRIGGER_NAME = "watchevent_block_insert"
+
+    def _create_abort_trigger(self):
+        from django.db import connection
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                CREATE TRIGGER {self.TRIGGER_NAME}
+                    BEFORE INSERT ON dashboard_watchevent
+                BEGIN
+                    SELECT RAISE(ABORT, 'watchevent insert blocked');
+                END;
+                """
+            )
+
+    def _drop_abort_trigger(self):
+        from django.db import connection
+
+        with connection.cursor() as cursor:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {self.TRIGGER_NAME}")
+
+    def tearDown(self):
+        # гарантированная очистка: триггер живёт только в тесте
+        self._drop_abort_trigger()
+        super().tearDown()
+
+    def test_real_trigger_failure_rolls_whole_attempt_back(self):
+        from django.db import IntegrityError
+
+        from dashboard.models import WatchEvent
+
+        rule = self.make_rule(direction=">=", threshold="100")
+        obs = self.add_obs(price="150")
+        # настоящий SQL-триггер RAISE(ABORT), не mock: вся попытка
+        # обработки откатывается
+        self._create_abort_trigger()
+        try:
+            with self.assertRaises(IntegrityError):
+                self.process(rule)
+        finally:
+            self._drop_abort_trigger()
+        # после сбоя НЕТ события и нет продвижения состояния/курсора
+        self.assertEqual(WatchEvent.objects.count(), 0)
+        rule.refresh_from_db()
+        self.assertEqual(rule.state, "armed")
+        self.assertEqual(rule.cursor_id, 0)
+        self.assertIsNone(rule.head_quote_time)
+        # ошибка явно журналируется процессом-обработчиком (коллектор
+        # не падает: process_share глотает и журнализует)
+        self._create_abort_trigger()
+        try:
+            with self.assertLogs("dashboard.services.watch_monitor"):
+                from dashboard.services import watch_monitor
+
+                self.assertEqual(watch_monitor.process_share(self.share), 0)
+        finally:
+            self._drop_abort_trigger()
+        self.assertEqual(WatchEvent.objects.count(), 0)
+        rule.refresh_from_db()
+        self.assertEqual(rule.cursor_id, 0)
+        # повторная обработка (окно не потеряно) — ровно один раз
+        self.assertEqual(self.process(rule), 1)
+        events = self.events(rule)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(str(events[0].observed_price), "150")
+        rule.refresh_from_db()
+        self.assertEqual(rule.state, "triggered")
+        self.assertEqual(rule.cursor_id, obs.id)
+        # третья обработка — без дублей
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 1)
+
+    def test_confirmed_duplicate_is_idempotent(self):
+        from dashboard.models import WatchEvent
+
+        rule = self.make_rule(direction=">=", threshold="100")
+        obs = self.add_obs(price="150")
+        # настоящий существующий дубль (как у параллельного обработчика)
+        WatchEvent.objects.create(
+            user=rule.user,
+            watch_rule=rule,
+            observation=obs,
+            figi=self.share.figi,
+            ticker=self.share.ticker,
+            share_name=self.share.name,
+            share_currency=self.share.currency,
+            direction=rule.direction,
+            threshold=rule.threshold,
+            source=rule.source,
+            currency=rule.currency,
+            observed_price="150",
+            quote_time=obs.quote_time,
+            message="parallel",
+        )
+        # IntegrityError есть, но пара реально существует →
+        # идемпотентный повтор: обновлённое состояние сохранено
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 1)
+        rule.refresh_from_db()
+        self.assertEqual(rule.state, "triggered")
+        self.assertEqual(rule.cursor_id, obs.id)
+
+
+class WatchInvalidPriceBaselineTests(WatchBase):
+    """Дефект приёмки 2: невалидная последняя цена не сбрасывает baseline.
+
+    Редактирование/включение выбирают последнее пригодное наблюдение
+    (конечная цена); новейшая not-a-number точка не даёт «лишнего»
+    уведомления позже.
+    """
+
+    def test_edit_rebase_uses_latest_valid_price(self):
+        # 150 (валидная, старая) → invalid (новейшая) → edit →
+        # 150 не создаёт лишнего события (условие остаётся
+        # выполненным); затем настоящий выход/вход
+        from dashboard.models import WatchRule
+
+        from .forms import WatchRuleForm
+
+        rule = self.make_rule(direction=">=", threshold="90")
+        first = self.add_obs(price="150", minutes=-60)
+        self.assertEqual(self.process(rule), 1)  # первое срабатывание
+        self.add_obs(price="not-a-number", minutes=-30)
+        self.assertEqual(self.process(rule), 0)  # перманентный пропуск
+        # редактирование: последнее пригодное = 150 → исходное
+        # состояние triggered (условие выполнено), БЕЗ уведомления;
+        # head_quote_time — ПО ВРЕМЕНИ валидной 150, не сброшен
+        form = WatchRuleForm(
+            data={
+                "share": str(rule.share_id),
+                "direction": ">=",
+                "threshold": "90",
+                "source": "demo",
+                "currency": "USD",
+                "enabled": "on",
+            }
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        form.apply_rule(self.user, instance=WatchRule.objects.get(id=rule.id))
+        rule = WatchRule.objects.get(id=rule.id)
+        self.assertEqual(rule.state, "triggered")
+        self.assertEqual(rule.head_quote_time, first.quote_time)
+        self.assertEqual(len(self.events(rule)), 1)
+        # ещё одна 150 — условие всё ещё выполнено: БЕЗ лишнего события
+        self.add_obs(price="150", minutes=-10)
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 1)
+        # настоящий выход (50 < 90) и вход (160) → новое событие
+        self.add_obs(price="50", minutes=-5)
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(rule.state, "armed")
+        self.add_obs(price="160", minutes=-1)
+        self.assertEqual(self.process(rule), 1)
+        self.assertEqual(len(self.events(rule)), 2)
+
+    def test_reenable_rebase_uses_latest_valid_price(self):
+        # включение после выключения: невалидная новейшая точка не
+        # сбрасывает исходное состояние; повторное включение считает
+        # baseline по последнему ПРИГОДНОМУ наблюдению
+        from dashboard.models import WatchRule
+
+        rule = self.make_rule(direction=">=", threshold="90")
+        first = self.add_obs(price="150", minutes=-60)
+        self.assertEqual(self.process(rule), 1)
+        self.add_obs(price="not-a-number", minutes=-30)
+        rule.enabled = False
+        rule.save()
+        # HTTP-путь включения (владелец)
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:watch-rule-toggle", args=[rule.pk])
+        )
+        self.assertEqual(r.status_code, 302)
+        rule = WatchRule.objects.get(id=rule.id)
+        self.assertTrue(rule.enabled)
+        # 150 (валидная) ≥ 90 → исходное состояние triggered, head
+        # по времени валидной точки
+        self.assertEqual(rule.state, "triggered")
+        self.assertEqual(rule.head_quote_time, first.quote_time)
+        self.assertEqual(len(self.events(rule)), 1)
+        # повторная 150 — без лишнего события
+        self.add_obs(price="150", minutes=-10)
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 1)
+
+    def test_creation_with_invalid_last_still_notifies_first_new(self):
+        # создание НЕ проигрывает старую историю: даже при валидной 150
+        # и невалидной новейшей, первое НОВОЕ наблюдение уведомляет
+        self.add_obs(price="150", minutes=-60)
+        self.add_obs(price="not-a-number", minutes=-30)
+        rule = self.make_rule(direction=">=", threshold="90")
+        self.assertEqual(rule.state, "armed")
+        self.assertEqual(len(self.events(rule)), 0)
+        self.add_obs(price="150", minutes=-10)
+        self.assertEqual(self.process(rule), 1)
+        self.assertEqual(len(self.events(rule)), 1)
+
+    def test_sequence_150_invalid_150_no_extra_event(self):
+        # последовательность 150 → invalid → 150: единственное событие
+        rule = self.make_rule(direction=">=", threshold="90")
+        self.add_obs(price="150", minutes=-30)
+        self.assertEqual(self.process(rule), 1)
+        self.add_obs(price="not-a-number", minutes=-20)
+        self.add_obs(price="150", minutes=-10)
+        self.assertEqual(self.process(rule), 0)
+        self.assertEqual(len(self.events(rule)), 1)
+        rule.refresh_from_db()
+        self.assertEqual(rule.state, "triggered")
+
+
+class WatchShareRemoveValidationTests(WatchBase):
+    """Дефект приёмки 3: некорректный ID share-remove не даёт 500."""
+
+    def test_remove_nonint_share_no_500_and_no_changes(self):
+        wl = self.make_list()
+        self.add_item(wl, self.share)
+        self.client.force_login(self.user)
+        for bad in ("abc", ""):
+            r = self.client.post(
+                reverse("dashboard:watchlist-detail", args=[wl.pk]),
+                {"action": "share-remove", "share": bad},
+            )
+            self.assertEqual(r.status_code, 200)
+            self.assertContains(r, "Некорректный инструмент")
+            # без изменений БД: элемент остался
+            self.assertEqual(wl.items.count(), 1)
+
+    def test_remove_valid_share_still_prg_302(self):
+        wl = self.make_list()
+        self.add_item(wl, self.share)
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:watchlist-detail", args=[wl.pk]),
+            {"action": "share-remove", "share": str(self.share.id)},
+        )
+        self.assertEqual(r.status_code, 302)  # PRG сохранён
+        self.assertEqual(wl.items.count(), 0)  # элемент удалён
+
+    def test_remove_missing_valid_id_ok(self):
+        # удаление несуществующего корректного ID — не 500, PRG
+        wl = self.make_list()
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:watchlist-detail", args=[wl.pk]),
+            {"action": "share-remove", "share": "99999"},
+        )
+        self.assertEqual(r.status_code, 302)

@@ -152,6 +152,9 @@ def apply_prices(prices, shares, source: str, now=None) -> tuple:
 
     Возвращает (обработано акций, создано новых наблюдений): повторная
     доставка, не создавшая строку, не считается новым наблюдением.
+    После записи наблюдений того же пути вызывается автоматическая
+    проверка правил мониторинга (watch_monitor, этап 3) — на обоих
+    вызовах (локальный коллектор, задача Celery).
     """
     from django.db import transaction
 
@@ -185,6 +188,18 @@ def apply_prices(prices, shares, source: str, now=None) -> tuple:
                 is_trend_high=is_trend_high,
                 updated_at=now,
                 last_price_source=source,
+            )
+        # Автоматическая проверка правил мониторинга (этап 3): общий путь
+        # записи наблюдений — локальный коллектор и Celery-задача вызывают
+        # её одинаково, Redis не обязателен. Сбой обработки правила
+        # журнализуется и не прерывает остальные правила и цикл.
+        from dashboard.services import watch_monitor
+
+        try:
+            watch_monitor.process_share(share, now=now)
+        except Exception as e:
+            logger.error(
+                f"apply_prices: watch rules for {share.figi} failed: {e}"
             )
         updated += 1
     return updated, created_observations
