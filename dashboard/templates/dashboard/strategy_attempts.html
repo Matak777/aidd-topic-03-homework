@@ -1,0 +1,70 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}<title>Журнал стратегий{% if strategy %}: {{ strategy.name }}{% endif %}</title>{% endblock %}
+
+{% block content %}
+<h3>Журнал стратегий{% if strategy %}: {{ strategy.name }}{% endif %}</h3>
+<p>Это журнал текущей виртуальной симуляции. Снимки условий, котировок,
+решений и операций сохраняются после изменения или удаления стратегии и инструмента.</p>
+<a href="{% url 'dashboard:strategies' %}" class="btn btn-outline-secondary my-2">К стратегиям</a>
+{% if strategy %}
+    <a href="{% url 'dashboard:strategy-attempts-all' %}" class="btn btn-outline-secondary my-2">Все попытки</a>
+    <p>Текущий портфель стратегии:
+        <a href="{% url 'dashboard:portfolio-detail' strategy.portfolio_id %}">{{ strategy.portfolio.name }}</a>.
+        {% if strategy.source == "demo" %}<strong>DEMO — синтетические котировки.</strong>{% endif %}
+    </p>
+    <p><strong>Общий результат портфеля включает ручные операции и другие стратегии.
+        Это не изолированная доходность данной стратегии.</strong>
+        Для изолированной оценки выделите отдельный портфель.</p>
+    {% if valuation_error %}
+        <p>Оценка портфеля недоступна: {{ valuation_error }}</p>
+    {% elif portfolio_summary %}
+        <dl>
+            <dt>Cash портфеля</dt><dd>{{ portfolio_summary.cash }} {{ strategy.portfolio.base_currency }}</dd>
+            <dt>Полная оценка</dt>
+            <dd>{% if portfolio_summary.total_value is None %}Неизвестна: нет котировки открытой позиции{% else %}{{ portfolio_summary.total_value }} {{ strategy.portfolio.base_currency }}{% endif %}</dd>
+            <dt>Совокупный результат / доходность портфеля</dt>
+            <dd>{% if portfolio_summary.overall_pl is None %}Неизвестны до полной оценки{% else %}{{ portfolio_summary.overall_pl }} {{ strategy.portfolio.base_currency }} / {{ portfolio_summary.return_pct }}%{% endif %}</dd>
+        </dl>
+    {% endif %}
+{% endif %}
+
+{% if page_obj.object_list %}
+<table class="table table-striped">
+    <thead><tr><th>Обработано</th><th>Стратегия / портфель</th><th>Наблюдение и условие</th><th>Действие</th><th>Решение</th><th>Виртуальная операция</th></tr></thead>
+    <tbody>
+    {% for attempt in page_obj %}
+        <tr id="attempt-{{ attempt.pk }}">
+            <td>{{ attempt.detected_at|date:"Y-m-d H:i:s" }}</td>
+            <td>
+                {{ attempt.strategy_name }}{% if not attempt.strategy_id %} (стратегия удалена){% endif %}<br>
+                {% if attempt.portfolio_id %}<a href="{% url 'dashboard:portfolio-detail' attempt.portfolio_id %}">{{ attempt.portfolio_name }}</a>{% else %}{{ attempt.portfolio_name }} (снимок){% endif %}
+            </td>
+            <td>
+                {{ attempt.ticker }} — {{ attempt.share_name }}<br>
+                {{ attempt.observed_price }} {{ attempt.currency }} {{ attempt.direction }} {{ attempt.threshold }}<br>
+                Котировка: {{ attempt.quote_time|date:"Y-m-d H:i:s" }} · {{ attempt.source }}
+                {% if attempt.source == "demo" %}<strong>DEMO</strong>{% endif %}
+            </td>
+            <td>{{ attempt.side }} {{ attempt.quantity }}; комиссия {{ attempt.commission }} {{ attempt.currency }}</td>
+            <td>{{ attempt.get_decision_display }}{% if attempt.reason %}<br>{{ attempt.reason }}{% endif %}</td>
+            <td>
+                {% if attempt.trade_id %}
+                    <a href="{% url 'dashboard:portfolio-journal' attempt.trade.portfolio_id %}#trade-{{ attempt.trade_id }}">Операция #{{ attempt.trade_id }}</a><br>
+                    {{ attempt.trade.side }} {{ attempt.trade.quantity }} × {{ attempt.trade.price }} {{ attempt.trade.currency }}<br>
+                    Исполнена {{ attempt.trade.executed_at|date:"Y-m-d H:i:s" }}
+                {% else %}Не создана{% endif %}
+            </td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% if page_obj.has_other_pages %}
+    <nav>
+        {% if page_obj.has_previous %}<a href="?page={{ page_obj.previous_page_number }}">Назад</a>{% endif %}
+        <span>{{ page_obj.number }} / {{ page_obj.paginator.num_pages }}</span>
+        {% if page_obj.has_next %}<a href="?page={{ page_obj.next_page_number }}">Вперёд</a>{% endif %}
+    </nav>
+{% endif %}
+{% else %}<p>Попыток пока нет.</p>{% endif %}
+{% endblock %}

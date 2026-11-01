@@ -13,6 +13,11 @@ from dashboard.views import (
     ShareHistoryView,
     ShareListView,
     ShareUpdateView,
+    StrategyAttemptsView,
+    StrategyDeleteView,
+    StrategyEditView,
+    StrategyListView,
+    StrategyToggleView,
     WatchlistDetailView,
     WatchlistListView,
     WatchNotificationListView,
@@ -104,6 +109,34 @@ urlpatterns = [
         "watch/notifications/<int:pk>/read",
         WatchNotificationReadView.as_view(),
         name="watch-notification-read",
+    ),
+    # --- Стратегии виртуальных сделок (этап 4). Владелец проверяется
+    # на сервере; изменения только POST с CSRF.
+    path("strategies", StrategyListView.as_view(), name="strategies"),
+    path(
+        "strategies/attempts",
+        StrategyAttemptsView.as_view(),
+        name="strategy-attempts-all",
+    ),
+    path(
+        "strategies/<int:pk>/edit",
+        StrategyEditView.as_view(),
+        name="strategy-edit",
+    ),
+    path(
+        "strategies/<int:pk>/toggle",
+        StrategyToggleView.as_view(),
+        name="strategy-toggle",
+    ),
+    path(
+        "strategies/<int:pk>/delete",
+        StrategyDeleteView.as_view(),
+        name="strategy-delete",
+    ),
+    path(
+        "strategies/<int:pk>/attempts",
+        StrategyAttemptsView.as_view(),
+        name="strategy-attempts",
     ),
     path("api/", include("dashboard.api.urls")),
 ]

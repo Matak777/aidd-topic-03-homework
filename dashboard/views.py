@@ -1,6 +1,8 @@
 from django.contrib.auth.mixins import UserPassesTestMixin
+from django.core.exceptions import ValidationError
 from django.core.paginator import Paginator
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
+from django.db.models import Count
 from django.http import Http404, HttpResponseServerError
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse_lazy
@@ -17,6 +19,8 @@ from .forms import ShareModelForm
 from .models import (
     Portfolio,
     Share,
+    Strategy,
+    StrategyAttempt,
     Watchlist,
 )
 from .services.graph import get_graph
@@ -306,6 +310,7 @@ def _trade_list(trades):
     """Строки журнала для шаблона."""
     out = []
     for tr in trades:
+        attempts = list(tr.strategy_attempts.all())
         out.append(
             {
                 "id": tr.id,
@@ -319,6 +324,7 @@ def _trade_list(trades):
                 "currency": tr.currency,
                 "executed_at": tr.executed_at,
                 "note": tr.note,
+                "strategy_attempt": attempts[0] if attempts else None,
             }
         )
     return out
@@ -333,7 +339,9 @@ class PortfolioJournalView(PortfolioOwnerMixin, View):
             if not request.user.is_authenticated:
                 return redirect("dashboard:index")
             raise Http404("Портфель не найден")
-        trades = portfolio.trades.order_by("executed_at", "id")
+        trades = portfolio.trades.order_by(
+            "executed_at", "id"
+        ).prefetch_related("strategy_attempts")
         paginator = Paginator(trades, 20)
         page_obj = paginator.get_page(request.GET.get("page"))
         return render(
@@ -836,10 +844,253 @@ class PortfolioDeleteView(PortfolioOwnerMixin, View):
                 {
                     "portfolio": portfolio,
                     "protected_error": (
-                        "Портфель нельзя удалить: в нём есть операции "
-                        "журнала. Удаление не уничтожает финансовую "
-                        "историю."
+                        "Портфель нельзя удалить: с ним связаны стратегии "
+                        "или операции журнала. Сначала удалите стратегии; "
+                        "финансовая история операций сохраняется."
                     ),
                 },
             )
         return redirect("dashboard:portfolios")
+
+
+# --- Стратегии виртуальных сделок (этап 4, группа 4) ------------------------
+
+
+def _strategy_auth(request):
+    """Аноним → redirect на главную (стратегии только для владельцев)."""
+    if not request.user.is_authenticated:
+        return redirect("dashboard:index")
+    return None
+
+
+def _strategy_rows(user):
+    strategies = (
+        Strategy.objects.filter(user=user, portfolio__user=user)
+        .select_related("portfolio", "share")
+        .order_by("id")
+    )
+    counts = {
+        (item["strategy_id"], item["decision"]): item["total"]
+        for item in StrategyAttempt.objects.filter(
+            user=user, strategy__user=user
+        )
+        .values("strategy_id", "decision")
+        .annotate(total=Count("id"))
+    }
+    return [
+        (
+            strategy,
+            {
+                key: counts.get((strategy.pk, decision), 0)
+                for key, decision in (
+                    ("executed", "executed"),
+                    ("rejected", "rejected"),
+                    ("skipped", "skipped"),
+                    ("errors", "error"),
+                )
+            },
+        )
+        for strategy in strategies
+    ]
+
+
+class StrategyListView(View):
+    """Список стратегий + создание (F4.1/F4.5)."""
+
+    template_name = "dashboard/strategies.html"
+
+    def get(self, request):
+        guard = _strategy_auth(request)
+        if guard:
+            return guard
+        from .forms import StrategyForm
+
+        return render(
+            request,
+            self.template_name,
+            {
+                "strategies": _strategy_rows(request.user),
+                "form": StrategyForm(user=request.user),
+            },
+        )
+
+    def post(self, request):
+        guard = _strategy_auth(request)
+        if guard:
+            return guard
+        from .forms import StrategyForm
+
+        form = StrategyForm(request.POST, user=request.user)
+        if form.is_valid():
+            try:
+                form.apply_strategy(request.user)
+            except (ValidationError, ValueError) as error:
+                form.add_error(None, error)
+            else:
+                return redirect("dashboard:strategies")
+        return render(
+            request,
+            self.template_name,
+            {"strategies": _strategy_rows(request.user), "form": form},
+        )
+
+
+class StrategyEditView(View):
+    """Редактирование стратегии (F4.1/F4.2): baseline пересчитывается
+    по последнему пригодному наблюдению БЕЗ исполнения."""
+
+    template_name = "dashboard/strategy_form.html"
+
+    def _strategy(self, request, pk):
+        return get_object_or_404(
+            Strategy.objects.select_related("portfolio", "share"),
+            id=pk,
+            user=request.user,
+            portfolio__user=request.user,
+        )
+
+    def get(self, request, pk):
+        guard = _strategy_auth(request)
+        if guard:
+            return guard
+        from .forms import StrategyForm
+
+        strategy = self._strategy(request, pk)
+        form = StrategyForm(
+            user=request.user,
+            initial={
+                "portfolio": strategy.portfolio,
+                "share": strategy.share,
+                "name": strategy.name,
+                "direction": strategy.direction,
+                "threshold": strategy.threshold,
+                "side": strategy.side,
+                "quantity": strategy.quantity,
+                "commission": strategy.commission,
+                "source": strategy.source,
+                "currency": strategy.currency,
+                "enabled": strategy.enabled,
+            },
+        )
+        return render(
+            request, self.template_name, {"form": form, "strategy": strategy}
+        )
+
+    def post(self, request, pk):
+        guard = _strategy_auth(request)
+        if guard:
+            return guard
+        from .forms import StrategyForm
+
+        strategy = self._strategy(request, pk)
+        form = StrategyForm(request.POST, user=request.user)
+        if form.is_valid():
+            try:
+                form.apply_strategy(request.user, instance=strategy)
+            except (ValidationError, ValueError) as error:
+                form.add_error(None, error)
+            else:
+                return redirect("dashboard:strategies")
+        return render(
+            request, self.template_name, {"form": form, "strategy": strategy}
+        )
+
+
+class StrategyToggleView(View):
+    """Вкл/откл стратегии (POST): включение перестраивает baseline
+    без исполнения; выключенная не исполняется (F4.5)."""
+
+    def post(self, request, pk):
+        guard = _strategy_auth(request)
+        if guard:
+            return guard
+        from .services import strategy_runner
+
+        with transaction.atomic():
+            strategy = get_object_or_404(
+                Strategy.objects.select_for_update(),
+                id=pk,
+                user=request.user,
+                portfolio__user=request.user,
+            )
+            strategy.enabled = not strategy.enabled
+            strategy.save(update_fields=("enabled", "updated_at"))
+            if strategy.enabled:
+                strategy_runner.reset_baseline(strategy, on_change=True)
+        return redirect("dashboard:strategies")
+
+
+class StrategyDeleteView(View):
+    """Удаление стратегии (POST): журнал попыток переживает его
+    (снимки, SET_NULL)."""
+
+    def post(self, request, pk):
+        guard = _strategy_auth(request)
+        if guard:
+            return guard
+        with transaction.atomic():
+            strategy = get_object_or_404(
+                Strategy.objects.select_for_update(),
+                id=pk,
+                user=request.user,
+                portfolio__user=request.user,
+            )
+            strategy.delete()
+        return redirect("dashboard:strategies")
+
+
+class StrategyAttemptsView(View):
+    """Журнал попыток стратегии (F4.3): решения, причины, сделки."""
+
+    template_name = "dashboard/strategy_attempts.html"
+    paginate_by = 50
+
+    def get(self, request, pk=None):
+        guard = _strategy_auth(request)
+        if guard:
+            return guard
+        strategy = None
+        attempts = StrategyAttempt.objects.filter(user=request.user)
+        if pk is not None:
+            strategy = get_object_or_404(
+                Strategy.objects.select_related("portfolio", "share"),
+                id=pk,
+                user=request.user,
+                portfolio__user=request.user,
+            )
+            attempts = attempts.filter(strategy=strategy)
+        attempts = attempts.select_related(
+            "portfolio", "trade__portfolio", "strategy"
+        ).order_by("-id")
+        context = {"strategy": strategy}
+        if strategy is not None:
+            from .services.portfolio_accounting import (
+                display_round,
+                portfolio_summary,
+            )
+
+            try:
+                summary = portfolio_summary(strategy.portfolio)
+                context["portfolio_summary"] = {
+                    key: (
+                        display_round(summary[key])
+                        if summary[key] is not None
+                        else None
+                    )
+                    for key in (
+                        "cash",
+                        "total_value",
+                        "overall_pl",
+                        "return_pct",
+                    )
+                }
+            except ValueError as error:
+                context["valuation_error"] = str(error)
+        paginator = Paginator(attempts, self.paginate_by)
+        page_obj = paginator.get_page(request.GET.get("page"))
+        context["page_obj"] = page_obj
+        return render(
+            request,
+            self.template_name,
+            context,
+        )

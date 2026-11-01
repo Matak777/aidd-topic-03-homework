@@ -1,9 +1,11 @@
 from django import forms
+from django.db import transaction
 
 from .models import (
     Portfolio,
     PriceObservation,
     Share,
+    Strategy,
     Trade,
     Watchlist,
     WatchRule,
@@ -359,3 +361,183 @@ class WatchRuleForm(forms.Form):
             # уведомления; если условие уже выполнено — нужен выход
             watch_monitor.reset_baseline(rule, on_change=True)
         return rule
+
+
+class StrategyForm(forms.Form):
+    """Стратегия виртуальных сделок (группа 4).
+
+    Источник должен совпадать с источником оценки портфеля, валюта —
+    с валютой портфеля (без регистра). Porог/количество — точно > 0
+    (AmountField positive), комиссия — ≥ 0.
+    """
+
+    portfolio = forms.ModelChoiceField(
+        queryset=Portfolio.objects.none(),
+        label="Портфель",
+        widget=forms.Select(attrs={"class": "form-select"}),
+        empty_label="—",
+    )
+    share = forms.ModelChoiceField(
+        queryset=Share.objects.all(),
+        label="Инструмент",
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
+    name = forms.CharField(
+        max_length=255,
+        label="Название",
+        widget=forms.TextInput(attrs={"class": "form-control"}),
+    )
+    direction = forms.TypedChoiceField(
+        choices=Strategy.DIRECTION_CHOICES,
+        label="Условие",
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
+    threshold = AmountField(positive=True, label="Порог (> 0)")
+    side = forms.TypedChoiceField(
+        choices=Strategy.SIDE_CHOICES,
+        label="Действие",
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
+    quantity = AmountField(positive=True, label="Количество (> 0)")
+    commission = AmountField(positive=False, label="Комиссия (>= 0)")
+    source = forms.TypedChoiceField(
+        choices=PriceObservation.SOURCE_CHOICES,
+        label="Источник оценки",
+        widget=forms.Select(attrs={"class": "form-select"}),
+    )
+    currency = forms.CharField(
+        max_length=20,
+        label="Валюта",
+        required=False,
+        help_text="Должна совпадать с валютой портфеля (без регистра); "
+        "пусто — валюта портфеля.",
+        widget=forms.TextInput(attrs={"class": "form-control"}),
+    )
+    enabled = forms.BooleanField(
+        label="Включено",
+        required=False,
+        initial=True,
+        widget=forms.CheckboxInput(attrs={"class": "form-check-input"}),
+    )
+
+    def __init__(self, *args, user=None, **kwargs):
+        self.user = user
+        super().__init__(*args, **kwargs)
+        if user is not None:
+            self.fields["portfolio"].queryset = Portfolio.objects.filter(
+                user=user
+            ).order_by("name", "id")
+
+    def clean_currency(self):
+        return (self.cleaned_data.get("currency") or "").strip().upper()
+
+    def clean(self):
+        cleaned = super().clean()
+        portfolio = cleaned.get("portfolio")
+        if portfolio is None:
+            return cleaned
+        # пусто — валюта портфеля
+        if not cleaned.get("currency"):
+            cleaned["currency"] = (
+                (portfolio.base_currency or "").strip().upper()
+            )
+        # источник/валюта совпадают с портфелем
+        if cleaned.get("source") != portfolio.valuation_source:
+            self.add_error(
+                "source",
+                "Источник стратегии должен совпадать с источником "
+                f"оценки портфеля ({portfolio.valuation_source}).",
+            )
+        if (cleaned.get("currency") or "").upper() != (
+            portfolio.base_currency or ""
+        ).strip().upper():
+            self.add_error(
+                "currency",
+                "Валюта стратегии должна совпадать с валютой портфеля "
+                f"({portfolio.base_currency.upper()}).",
+            )
+        share = cleaned.get("share")
+        if share is not None and (
+            (share.currency or "").strip().casefold()
+            != (portfolio.base_currency or "").strip().casefold()
+        ):
+            self.add_error(
+                "share",
+                "Валюта инструмента должна совпадать с валютой портфеля; "
+                "валютная конвертация не выполняется.",
+            )
+        return cleaned
+
+    @transaction.atomic
+    def apply_strategy(self, user, instance=None):
+        """Создание/редактирование + пересчёт baseline (без исполнения).
+
+        Создание: старая история не проигрывается. Редактирование:
+        последняя пригодная совместимая небудущая цена — исходное
+        состояние; уже выполненное условие требует выхода.
+        """
+        from .services import strategy_runner
+        from .services.portfolio_accounting import canonical_amount
+
+        cleaned = self.cleaned_data
+        if instance is not None:
+            try:
+                instance = Strategy.objects.select_for_update().get(
+                    pk=instance.pk, user=user, portfolio__user=user
+                )
+            except Strategy.DoesNotExist as error:
+                raise forms.ValidationError("Стратегия недоступна.") from error
+        try:
+            portfolio = Portfolio.objects.select_for_update().get(
+                pk=cleaned["portfolio"].pk, user=user
+            )
+            share = Share.objects.select_for_update().get(
+                pk=cleaned["share"].pk
+            )
+        except (Portfolio.DoesNotExist, Share.DoesNotExist) as error:
+            raise forms.ValidationError(
+                "Портфель или инструмент больше недоступен."
+            ) from error
+        currency = cleaned["currency"].strip().upper()
+        if (
+            cleaned["source"] != portfolio.valuation_source
+            or currency.casefold()
+            != portfolio.base_currency.strip().casefold()
+            or currency.casefold() != share.currency.strip().casefold()
+        ):
+            raise forms.ValidationError(
+                "Источник и валюта должны совпадать с портфелем и инструментом."
+            )
+        threshold = canonical_amount(
+            cleaned["threshold"], positive=True, label="порог"
+        )
+        quantity = canonical_amount(
+            cleaned["quantity"], positive=True, label="количество"
+        )
+        commission = canonical_amount(
+            cleaned["commission"], positive=False, label="комиссия"
+        )
+        fields = dict(
+            portfolio=portfolio,
+            share=share,
+            name=cleaned["name"].strip(),
+            direction=cleaned["direction"],
+            threshold=threshold,
+            side=cleaned["side"],
+            quantity=quantity,
+            commission=commission,
+            source=cleaned["source"],
+            currency=currency,
+            enabled=bool(cleaned.get("enabled")),
+        )
+        if instance is None:
+            strategy = Strategy(user=user, **fields)
+            strategy.save()
+            strategy_runner.reset_baseline(strategy, on_change=False)
+        else:
+            for attr, value in fields.items():
+                setattr(instance, attr, value)
+            instance.save()
+            strategy = instance
+            strategy_runner.reset_baseline(strategy, on_change=True)
+        return strategy

@@ -201,6 +201,18 @@ def apply_prices(prices, shares, source: str, now=None) -> tuple:
             logger.error(
                 f"apply_prices: watch rules for {share.figi} failed: {e}"
             )
+        # Автоматическое исполнение стратегий виртуальных сделок (этап
+        # 4): тот же общий путь записи, условия мониторинга
+        # переиспользуются. Сбой одной стратегии журнализуется и не
+        # прерывает остальные стратегии/правила/цикл записи.
+        from dashboard.services import strategy_runner
+
+        try:
+            strategy_runner.process_share(share, now=now)
+        except Exception as e:
+            logger.error(
+                f"apply_prices: strategies for {share.figi} failed: {e}"
+            )
         updated += 1
     return updated, created_observations
 

@@ -1,0 +1,163 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}
+    <title>Стратегии виртуальных сделок</title>
+{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-12">
+        <h3>Стратегии виртуальных сделок</h3>
+        <a href="{% url 'dashboard:strategy-attempts-all' %}" class="btn btn-outline-secondary my-2">Все попытки, включая удалённые стратегии</a>
+
+        <p class="text-muted">
+            Сделки только виртуальные (симуляция, не бэктест): исполнение
+            через общий движок портфеля, время исполнения — фактическое,
+            не время котировки. Источник и валюта должны совпадать с
+            портфелем. Первый вход даёт одну попытку; пока условие
+            выполнено — без повторов; выход/вход — новая попытка; отказ
+            (нет денег/остатка) записывается журналом и расходует попытку.
+        </p>
+        <p>Счётчики ниже показывают решения обработчика, а не доходность.
+            Общие результаты портфеля включают ручные операции и другие стратегии;
+            для изолированной оценки используйте отдельный портфель.</p>
+
+        <div class="card my-3">
+            <div class="card-body">
+                <h5 class="card-title">Новая стратегия</h5>
+                <form method="post" novalidate>
+                    {% csrf_token %}
+                    {% if form.non_field_errors %}
+                        <div class="alert alert-danger">
+                            {% for e in form.non_field_errors %}<div>{{ e }}</div>{% endfor %}
+                        </div>
+                    {% endif %}
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label" for="{{ form.name.id_for_label }}">{{ form.name.label }}</label>
+                            {{ form.name }}
+                            {% for e in form.name.errors %}<div class="text-danger">{{ e }}</div>{% endfor %}
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label" for="{{ form.portfolio.id_for_label }}">{{ form.portfolio.label }}</label>
+                            {{ form.portfolio }}
+                            {% for e in form.portfolio.errors %}<div class="text-danger">{{ e }}</div>{% endfor %}
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">{{ form.share.label }}</label>
+                            {{ form.share }}
+                            {% for e in form.share.errors %}<div class="text-danger">{{ e }}</div>{% endfor %}
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label class="form-label">{{ form.direction.label }}</label>
+                            {{ form.direction }}
+                            {% for e in form.direction.errors %}<div class="text-danger">{{ e }}</div>{% endfor %}
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label class="form-label">{{ form.threshold.label }}</label>
+                            {{ form.threshold }}
+                            {% for e in form.threshold.errors %}<div class="text-danger">{{ e }}</div>{% endfor %}
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label class="form-label">{{ form.side.label }}</label>
+                            {{ form.side }}
+                            {% for e in form.side.errors %}<div class="text-danger">{{ e }}</div>{% endfor %}
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label class="form-label">{{ form.quantity.label }}</label>
+                            {{ form.quantity }}
+                            {% for e in form.quantity.errors %}<div class="text-danger">{{ e }}</div>{% endfor %}
+                        </div>
+                        <div class="col-md-3 mb-3">
+                            <label class="form-label">{{ form.commission.label }}</label>
+                            {{ form.commission }}
+                            {% for e in form.commission.errors %}<div class="text-danger">{{ e }}</div>{% endfor %}
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">{{ form.source.label }}</label>
+                            {{ form.source }}
+                            {% for e in form.source.errors %}<div class="text-danger">{{ e }}</div>{% endfor %}
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label class="form-label">{{ form.currency.label }}</label>
+                            {{ form.currency }}
+                            {% if form.currency.help_text %}<div class="form-text">{{ form.currency.help_text }}</div>{% endif %}
+                            {% for e in form.currency.errors %}<div class="text-danger">{{ e }}</div>{% endfor %}
+                        </div>
+                        <div class="col-md-4 mb-3">
+                            <label class="form-check-label">{{ form.enabled }} {{ form.enabled.label }}</label>
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Создать стратегию</button>
+                </form>
+            </div>
+        </div>
+
+        {% if strategies %}
+            <table class="table table-striped">
+                <thead>
+                <tr>
+                    <th>Название</th>
+                    <th>Портфель</th>
+                    <th>Инструмент / условие</th>
+                    <th>Действие</th>
+                    <th>Источник</th>
+                    <th>Состояние</th>
+                    <th>Журнал</th>
+                    <th></th>
+                </tr>
+                </thead>
+                <tbody>
+                {% for s, stats in strategies %}
+                    <tr>
+                        <td>{{ s.name }}</td>
+                        <td><a href="{% url 'dashboard:portfolio-detail' s.portfolio_id %}">{{ s.portfolio.name }}</a></td>
+                        <td>{{ s.share.ticker }} цена {{ s.direction }} {{ s.threshold }}</td>
+                        <td>{{ s.side }} {{ s.quantity }} (комиссия {{ s.commission }})</td>
+                        <td>
+                            {{ s.source }}
+                            {% if s.is_demo %}<span class="badge bg-warning text-dark">DEMO</span>{% endif %}
+                        </td>
+                        <td>
+                            {% if not s.enabled %}
+                                <span class="badge bg-secondary">Отключено</span>
+                            {% elif s.state == "triggered" %}
+                                <span class="badge bg-success">Условие выполнено</span>
+                            {% else %}
+                                <span class="badge bg-info text-dark">Ожидает события</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            <span class="badge bg-primary">успешно: {{ stats.executed }}</span>
+                            <span class="badge bg-light text-dark">отказов: {{ stats.rejected }}</span>
+                            <span class="badge bg-light text-dark">пропусков: {{ stats.skipped }}</span>
+                            <span class="badge bg-light text-dark">ошибок: {{ stats.errors }}</span>
+                            <a href="{% url 'dashboard:strategy-attempts' s.id %}">журнал</a>
+                        </td>
+                        <td>
+                            <form method="post" class="d-inline">
+                                {% csrf_token %}
+                                <button type="submit" class="btn btn-sm btn-outline-secondary"
+                                        formaction="{% url 'dashboard:strategy-toggle' s.id %}">
+                                    {% if s.enabled %}Отключить{% else %}Включить{% endif %}
+                                </button>
+                            </form>
+                            <a href="{% url 'dashboard:strategy-edit' s.id %}"
+                               class="btn btn-sm btn-outline-primary">Править</a>
+                            <form method="post" class="d-inline"
+                                  onsubmit="return confirm('Удалить стратегию? Журнал попыток останется.');">
+                                {% csrf_token %}
+                                <button type="submit" class="btn btn-sm btn-outline-danger"
+                                        formaction="{% url 'dashboard:strategy-delete' s.id %}">Удалить</button>
+                            </form>
+                        </td>
+                    </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        {% else %}
+            <p class="text-muted">Стратегий пока нет. Создайте первую.</p>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}

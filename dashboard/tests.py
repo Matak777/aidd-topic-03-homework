@@ -4249,3 +4249,793 @@ class WatchShareRemoveValidationTests(WatchBase):
             {"action": "share-remove", "share": "99999"},
         )
         self.assertEqual(r.status_code, 302)
+
+
+# --- Этап 4: стратегии виртуальных сделок (группа 4) ------------------------
+
+
+class StrategyBase(WatchBase):
+    """Общая подготовка тестов стратегий (этап 4)."""
+
+    def setUp(self):
+        super().setUp()
+        from dashboard.models import Portfolio
+
+        self.portfolio = Portfolio.objects.create(
+            user=self.user,
+            name="Strat",
+            base_currency="USD",
+            valuation_source="demo",
+            initial_cash="1000",
+            cash="1000",
+        )
+        self.other_portfolio = Portfolio.objects.create(
+            user=self.other,
+            name="Other",
+            base_currency="USD",
+            valuation_source="demo",
+            initial_cash="1000",
+            cash="1000",
+        )
+
+    def trade(
+        self, portfolio, side, quantity, price, executed_at=None, **kwargs
+    ):
+        """Ручная операция через общий сервис этапа 2 (setup)."""
+        from django.utils import timezone
+
+        from dashboard.services.portfolio_accounting import execute_trade
+
+        if executed_at is None:
+            executed_at = timezone.now()
+        return execute_trade(
+            portfolio,
+            side=side,
+            share=self.share,
+            quantity=quantity,
+            price=price,
+            executed_at=executed_at,
+            **kwargs,
+        )
+
+    def make_strat(
+        self,
+        *,
+        user=None,
+        portfolio=None,
+        share=None,
+        name="S1",
+        direction=">=",
+        threshold="100",
+        side="BUY",
+        quantity="1",
+        commission="0",
+        source="demo",
+        currency="USD",
+        enabled=True,
+        reset=True,
+    ):
+        from dashboard.models import Strategy
+        from dashboard.services.strategy_runner import (
+            process_strategy,
+            reset_baseline,
+        )
+
+        strategy = Strategy.objects.create(
+            user=user or self.user,
+            portfolio=portfolio or self.portfolio,
+            share=share or self.share,
+            name=name,
+            direction=direction,
+            threshold=threshold,
+            side=side,
+            quantity=quantity,
+            commission=commission,
+            source=source,
+            currency=currency,
+            enabled=enabled,
+        )
+        if reset:
+            reset_baseline(strategy)
+        return strategy
+
+    def process(self, strategy):
+        from dashboard.services.strategy_runner import process_strategy
+
+        count = process_strategy(strategy)
+        strategy.refresh_from_db(
+            fields=["state", "cursor_id", "head_quote_time"]
+        )
+        return count
+
+    def attempts(self, strategy):
+        from dashboard.models import StrategyAttempt
+
+        return list(
+            StrategyAttempt.objects.filter(strategy=strategy).order_by("id")
+        )
+
+
+class StrategyCoreTests(StrategyBase):
+    """Движок условий и исполнение: BUY/SELL, ≥/≤/равенство (этап 4)."""
+
+    def test_control_example_buy_execute_cash(self):
+        # Контрольный пример: капитал 1000, цена 100 → BUY 1, cash 900;
+        # следующая цена 105 НЕ дублирует покупку (состояние triggered).
+        strategy = self.make_strat(direction=">=", threshold="100")
+        self.assertEqual(strategy.state, "armed")
+        self.add_obs(price="100")  # равенство порогу удовлетворяет
+        self.assertEqual(self.process(strategy), 1)
+        attempts = self.attempts(strategy)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].decision, "executed")
+        self.assertIsNotNone(attempts[0].trade)
+        trade = attempts[0].trade
+        self.assertEqual(trade.side, "BUY")
+        self.assertEqual(str(trade.price), "100")
+        self.assertEqual(str(trade.quantity), "1")
+        self.portfolio.refresh_from_db()
+        self.assertEqual(str(self.portfolio.cash), "900")
+
+    def test_satisfied_price_no_duplicate_and_valuation(self):
+        # цена 105 при triggered: попыток нет; оценка 1005, P/L 5 —
+        # считаются из ledger + сохранённых цен (общий сервис этапа 2)
+        strategy = self.make_strat(direction=">=", threshold="100")
+        self.add_obs(price="100")
+        self.assertEqual(self.process(strategy), 1)
+        self.add_obs(price="105")
+        self.assertEqual(self.process(strategy), 0)
+        attempts = self.attempts(strategy)
+        self.assertEqual(len(attempts), 1)  # одну попытку, не две
+        self.portfolio.refresh_from_db()
+        self.assertEqual(str(self.portfolio.cash), "900")
+        from dashboard.services import portfolio_accounting as pa
+
+        # позиция: 1 шт, себестоимость 100, оценка по последней
+        # совместимой цене наблюдений (105)
+        rows = pa.position_rows(self.portfolio)
+        self.assertEqual(len(rows["cards"]), 1)
+        card = rows["cards"][0]
+        self.assertEqual(card["open_qty"], Decimal("1"))
+        self.assertEqual(card["market_quote"], Decimal("105"))
+        self.assertEqual(card["market_value"], Decimal("105"))
+        self.assertEqual(card["cost"], Decimal("100"))
+        self.assertEqual(card["unrealized_pl"], Decimal("5"))
+        summary = pa.portfolio_summary(self.portfolio)
+        self.assertEqual(summary["cash"], Decimal("900"))
+        self.assertEqual(summary["market_value"], Decimal("105"))
+        self.assertEqual(summary["total_value"], Decimal("1005"))
+        self.assertEqual(summary["realized_pl"], Decimal("0"))
+        self.assertEqual(summary["unrealized_pl"], Decimal("5"))
+        self.assertEqual(summary["overall_pl"], Decimal("5"))
+
+    def test_lte_condition_sell_without_position_rejected(self):
+        # SELL при отсутствии остатка: записанный отказ без изменения
+        # портфеля; попытка «израсходована» до выхода/входа
+        strategy = self.make_strat(direction="<=", threshold="50", side="SELL")
+        self.add_obs(price="50")
+        self.assertEqual(self.process(strategy), 1)
+        attempts = self.attempts(strategy)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].decision, "rejected")
+        self.assertIn("нельзя продать", attempts[0].reason)
+        self.assertIsNone(attempts[0].trade)
+        self.portfolio.refresh_from_db()
+        self.assertEqual(str(self.portfolio.cash), "1000")
+        # пока условие выполнено — новых попыток нет
+        self.add_obs(price="45")
+        self.assertEqual(self.process(strategy), 0)
+        self.assertEqual(len(self.attempts(strategy)), 1)
+
+    def test_sell_with_position_executes(self):
+        # позиция есть: SELL исполняется в портфель
+        self.trade(self.portfolio, "BUY", "2", "90", commission="0")
+        strategy = self.make_strat(
+            direction="<=", threshold="85", side="SELL", quantity="1"
+        )
+        self.add_obs(price="85")
+        self.assertEqual(self.process(strategy), 1)
+        attempts = self.attempts(strategy)
+        self.assertEqual(attempts[0].decision, "executed")
+        self.portfolio.refresh_from_db()
+        # cash: 1000 − 2×90 (ручная BUY) + 85 (SELL) = 905
+        self.assertEqual(str(self.portfolio.cash), "905")
+
+    def test_exit_reentry_new_attempt(self):
+        strategy = self.make_strat(direction=">=", threshold="100")
+        self.add_obs(price="110")
+        self.assertEqual(self.process(strategy), 1)
+        self.add_obs(price="90")  # выход
+        self.assertEqual(self.process(strategy), 0)
+        self.assertEqual(strategy.state, "armed")
+        # снова вход (то же правило): НОВАЯ попытка
+        self.add_obs(price="120")
+        self.assertEqual(self.process(strategy), 1)
+        attempts = self.attempts(strategy)
+        self.assertEqual(len(attempts), 2)
+        # вторая сделка повилась на другом наблюдении
+        self.assertNotEqual(
+            attempts[0].observation_id, attempts[1].observation_id
+        )
+
+    def test_no_data_waits_first_new_observation(self):
+        strategy = self.make_strat(direction=">=", threshold="100")
+        self.assertEqual(strategy.cursor_id, 0)
+        self.assertEqual(strategy.state, "armed")
+        self.add_obs(price="110")
+        self.assertEqual(self.process(strategy), 1)
+        self.assertEqual(len(self.attempts(strategy)), 1)
+
+
+class StrategyPolicyTests(StrategyBase):
+    """Baseline/редактирование/включение; валюты/источники/точности."""
+
+    def test_edit_rebase_without_execution_needs_exit(self):
+        strategy = self.make_strat(direction=">=", threshold="90")
+        first = self.add_obs(price="150")
+        self.assertEqual(self.process(strategy), 1)
+        # редактирование порога: актуальная цена 150 ≥ 95 → triggered
+        # без исполнения; нужен выход перед новой попыткой
+        from dashboard.models import Strategy
+
+        from .forms import StrategyForm
+
+        form = StrategyForm(
+            user=self.user,
+            data={
+                "portfolio": str(strategy.portfolio_id),
+                "share": str(self.share.id),
+                "name": "S1",
+                "direction": ">=",
+                "threshold": "95",
+                "side": "BUY",
+                "quantity": "1",
+                "commission": "0",
+                "source": "demo",
+                "currency": "USD",
+                "enabled": "on",
+            },
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        form.apply_strategy(
+            self.user, instance=Strategy.objects.get(id=strategy.id)
+        )
+        strategy = Strategy.objects.get(id=strategy.id)
+        self.assertEqual(str(strategy.threshold), "95")
+        self.assertEqual(strategy.state, "triggered")
+        self.assertEqual(len(self.attempts(strategy)), 1)
+        self.portfolio.refresh_from_db()
+        self.assertEqual(str(self.portfolio.cash), "850")  # одна сделка @150
+        # ещё одна подходящая цена — без второй покупки
+        self.add_obs(price="160")
+        self.assertEqual(self.process(strategy), 0)
+        self.portfolio.refresh_from_db()
+        self.assertEqual(str(self.portfolio.cash), "850")
+        # выход (94 < 95) и вход (100) → вторая попытка
+        self.add_obs(price="94")
+        self.assertEqual(self.process(strategy), 0)
+        self.add_obs(price="100")
+        self.assertEqual(self.process(strategy), 1)
+        self.assertEqual(len(self.attempts(strategy)), 2)
+        self.portfolio.refresh_from_db()
+        self.assertEqual(str(self.portfolio.cash), "750")
+
+    def test_enable_rebase_no_execution(self):
+        strategy = self.make_strat(direction=">=", threshold="999")
+        self.add_obs(price="150")
+        self.assertEqual(self.process(strategy), 0)
+        strategy.enabled = False
+        strategy.save()
+        self.add_obs(price="150")
+        self.assertEqual(self.process(strategy), 0)
+        # включение через HTTP: baseline по последнему пригодному без сделки
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:strategy-toggle", args=[strategy.pk])
+        )
+        self.assertEqual(r.status_code, 302)
+        strategy.refresh_from_db()
+        self.assertTrue(strategy.enabled)
+        self.assertEqual(strategy.state, "armed")
+        self.assertEqual(len(self.attempts(strategy)), 0)
+        self.add_obs(price="1000")
+        self.assertEqual(self.process(strategy), 1)
+        self.assertEqual(len(self.attempts(strategy)), 1)
+
+    def test_disabled_strategy_never_executes(self):
+        strategy = self.make_strat(enabled=False)
+        self.add_obs(price="500")
+        self.assertEqual(self.process(strategy), 0)
+        self.assertEqual(len(self.attempts(strategy)), 0)
+        self.portfolio.refresh_from_db()
+        self.assertEqual(str(self.portfolio.cash), "1000")
+
+    def test_invalid_last_price_does_not_rebase(self):
+        # невалидная последняя точка не сбрасывает baseline (сервис
+        # reset_baseline переиспользуется из ревизии мониторинга)
+        from dashboard.models import Strategy
+
+        strategy = self.make_strat(direction=">=", threshold="90")
+        first = self.add_obs(price="150")
+        self.assertEqual(self.process(strategy), 1)
+        self.add_obs(price="not-a-number")
+        # редактирование — то же самое цена/условие: baseline по 150
+        from .forms import StrategyForm
+
+        form = StrategyForm(
+            user=self.user,
+            data={
+                "portfolio": str(strategy.portfolio_id),
+                "share": str(self.share.id),
+                "name": "S1",
+                "direction": ">=",
+                "threshold": "90",
+                "side": "BUY",
+                "quantity": "1",
+                "commission": "0",
+                "source": "demo",
+                "currency": "USD",
+                "enabled": "on",
+            },
+        )
+        self.assertTrue(form.is_valid(), form.errors)
+        form.apply_strategy(
+            self.user, instance=Strategy.objects.get(id=strategy.id)
+        )
+        strategy = Strategy.objects.get(id=strategy.id)
+        self.assertEqual(strategy.head_quote_time, first.quote_time)
+        self.assertEqual(strategy.state, "triggered")
+        # ещё 150 — без лишней попытки
+        self.add_obs(price="150")
+        self.assertEqual(self.process(strategy), 0)
+        self.assertEqual(len(self.attempts(strategy)), 1)
+
+    def test_currency_source_compatibility(self):
+        strategy = self.make_strat(currency="USD", source="demo")
+        # usd — та же валюта (в один источник demo)
+        self.add_obs(price="150", currency="usd")
+        self.assertEqual(self.process(strategy), 1)
+        # чужой источник — наблюдения не меняют состояние
+        strategy2 = self.make_strat(name="S2", source="tinkoff")
+        self.add_obs(price="150", source="demo")
+        self.assertEqual(self.process(strategy2), 0)
+        self.assertEqual(strategy2.state, "armed")
+        # чужая валюта
+        strategy3 = self.make_strat(name="S3", currency="EUR")
+        self.add_obs(price="150", currency="USD")
+        self.assertEqual(self.process(strategy3), 0)
+        # будущее время не меняет состояние
+        strategy4 = self.make_strat(name="S4")
+        self.add_obs(price="999", minutes=60)
+        self.assertEqual(self.process(strategy4), 0)
+        self.assertEqual(len(self.attempts(strategy4)), 0)
+
+    def test_precision_quantity_commission(self):
+        # точность величин: количество и комиссия — ExactAmountField
+        strategy = self.make_strat(
+            direction=">=", threshold="100", quantity="0.000000000000000001"
+        )
+        self.add_obs(price="150")
+        self.assertEqual(self.process(strategy), 1)
+        attempts = self.attempts(strategy)
+        trade = attempts[0].trade
+        self.assertEqual(str(trade.quantity), "0.000000000000000001")
+        self.portfolio.refresh_from_db()
+        # cash ≈ 1000 − 150×1e-18: хвост нулей точный
+        self.assertEqual(str(trade.commission), "0")
+
+    def test_equal_quote_time_sequence_no_backdating(self):
+        # время исполнения = now процесса, НЕ время котировки: две
+        # точки окна исполняются в порядке наблюдения, время сделки
+        # фактическое (now), никакой задним числостью
+        from dashboard.models import Trade
+
+        strategy = self.make_strat(direction=">=", threshold="100")
+        o1 = self.add_obs(price="110", minutes=-30)
+        o2 = self.add_obs(price="50", minutes=-20)
+        o3 = self.add_obs(price="120", minutes=-10)
+        now0 = timezone.now()
+        self.assertLess(o3.quote_time, now0)
+        self.assertEqual(self.process(strategy), 2)
+        attempts = self.attempts(strategy)
+        # попытки отсчитаны по 110 и 120; по времени исполнения now0
+        for a in attempts:
+            self.assertGreaterEqual(a.trade.executed_at, now0)
+        self.assertEqual(
+            Trade.objects.filter(portfolio=self.portfolio).count(), 2
+        )
+
+
+class StrategyBacklogOrderTests(StrategyBase):
+    """Backlog/порядок/повторы (этап 4)."""
+
+    def test_backlog_processed_in_order_single_portfolio(self):
+        # две стратегии одного портфеля: обрабатываются по очереди;
+        # первая покупает на первом входе, вторая — на своём
+        s1 = self.make_strat(name="A", direction=">=", threshold="100")
+        s2 = self.make_strat(name="B", direction="<=", threshold="95")
+        self.add_obs(price="120", minutes=-10)
+        self.add_obs(price="90", minutes=-5)
+        self.assertEqual(self.process(s1), 1)
+        self.assertEqual(self.process(s2), 1)
+        attempts1 = self.attempts(s1)
+        attempts2 = self.attempts(s2)
+        self.assertEqual(attempts1[0].decision, "executed")
+        self.assertEqual(attempts2[0].decision, "executed")
+        self.portfolio.refresh_from_db()
+        # две покупки по 1: 120 и 90; cash 1000 − 210 = 790
+        self.assertEqual(str(self.portfolio.cash), "790")
+
+    def test_reprocess_no_duplicates(self):
+        from dashboard.models import Trade
+
+        strategy = self.make_strat(direction=">=", threshold="100")
+        self.add_obs(price="110")
+        self.assertEqual(self.process(strategy), 1)
+        for _ in range(3):
+            self.assertEqual(self.process(strategy), 0)
+        self.assertEqual(len(self.attempts(strategy)), 1)
+        self.assertEqual(
+            Trade.objects.filter(portfolio=self.portfolio).count(), 1
+        )
+
+    def test_confirmed_duplicate_attempt_is_idempotent(self):
+        from dashboard.models import Trade
+
+        strategy = self.make_strat(direction=">=", threshold="100")
+        obs = self.add_obs(price="110")
+        # «параллельный» обработчик успел создать попытку и сделку
+        before_trades = Trade.objects.count()
+        from dashboard.models import StrategyAttempt
+
+        trade = self.trade(
+            self.portfolio,
+            "BUY",
+            "1",
+            "110",
+            idempotency_key=f"strategy:{strategy.id}:obs:{obs.id}",
+        )
+        StrategyAttempt.objects.create(
+            user=strategy.user,
+            strategy=strategy,
+            observation=obs,
+            portfolio=strategy.portfolio,
+            trade=trade,
+            strategy_name=strategy.name,
+            figi=strategy.share.figi,
+            ticker=strategy.share.ticker,
+            share_name=strategy.share.name,
+            share_currency=strategy.share.currency,
+            portfolio_name=strategy.portfolio.name,
+            portfolio_currency=strategy.portfolio.base_currency,
+            direction=strategy.direction,
+            threshold=strategy.threshold,
+            source=strategy.source,
+            currency=strategy.currency,
+            side=strategy.side,
+            quantity=strategy.quantity,
+            commission=strategy.commission,
+            observed_price="110",
+            quote_time=obs.quote_time,
+            decision="executed",
+        )
+        self.assertEqual(self.process(strategy), 0)
+        self.assertEqual(len(self.attempts(strategy)), 1)
+        self.assertEqual(Trade.objects.count(), before_trades + 1)
+        strategy.refresh_from_db()
+        self.assertEqual(strategy.state, "triggered")
+
+
+class StrategyFailureIsolationTests(StrategyBase):
+    """Сбой записи: полный откат попытки, реальный дубликат, изоляция."""
+
+    TRIGGER_NAME = "strategyattempt_block_insert"
+
+    def _create_trigger(self):
+        from django.db import connection
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                CREATE TRIGGER {self.TRIGGER_NAME}
+                    BEFORE INSERT ON dashboard_strategyattempt
+                BEGIN
+                    SELECT RAISE(ABORT, 'attempts insert blocked');
+                END;
+                """
+            )
+
+    def _drop_trigger(self):
+        from django.db import connection
+
+        with connection.cursor() as cursor:
+            cursor.execute(f"DROP TRIGGER IF EXISTS {self.TRIGGER_NAME}")
+
+    def tearDown(self):
+        self._drop_trigger()
+        super().tearDown()
+
+    def test_real_write_failure_rolls_back_everything(self):
+        from django.db import IntegrityError
+
+        from dashboard.models import Trade
+
+        strategy = self.make_strat(direction=">=", threshold="100")
+        obs = self.add_obs(price="110")
+        self._create_trigger()
+        try:
+            with self.assertRaises(IntegrityError):
+                self.process(strategy)
+        finally:
+            self._drop_trigger()
+        # журнала нет, сделки нет, cash не тронут, состояние/курсор не
+        # продвинуты — попытка восстановима
+        self.assertEqual(len(self.attempts(strategy)), 0)
+        self.assertEqual(
+            Trade.objects.filter(portfolio=self.portfolio).count(), 0
+        )
+        self.portfolio.refresh_from_db()
+        self.assertEqual(str(self.portfolio.cash), "1000")
+        strategy.refresh_from_db()
+        self.assertEqual(strategy.state, "armed")
+        self.assertEqual(strategy.cursor_id, 0)
+        self.assertEqual(strategy.head_quote_time, None)
+        # успешная доработка: ровно одна попытка/сделка
+        self.assertEqual(self.process(strategy), 1)
+        self.assertEqual(len(self.attempts(strategy)), 1)
+        self.assertEqual(
+            Trade.objects.filter(portfolio=self.portfolio).count(), 1
+        )
+        strategy.refresh_from_db()
+        self.assertEqual(strategy.state, "triggered")
+
+    def test_one_strategy_failure_others_continue(self):
+        from unittest import mock
+
+        s_ok = self.make_strat(name="OK", direction=">=", threshold="100")
+        s_bad = self.make_strat(name="BAD", direction=">=", threshold="100")
+        self.add_obs(price="110")
+        from dashboard.services import strategy_runner
+
+        real_run = strategy_runner._run_attempt
+
+        def boom_or_run(strategy, obs, price, *, now):
+            # подлинный сбой на одной стратегии; остальные продолжают
+            if strategy.id == s_bad.id:
+                raise RuntimeError("boom")
+            return real_run(strategy, obs, price, now=now)
+
+        with self.subTest("isolation"):
+            with mock.patch.object(
+                strategy_runner, "_run_attempt", side_effect=boom_or_run
+            ):
+                total = strategy_runner.process_share(self.share)
+        # цикл не упал: OK-стратегия исполнилась, BAD — нет;
+        # наблюдения и данные целы
+        self.assertEqual(len(self.attempts(s_bad)), 0)
+        ok_attempts = self.attempts(s_ok)
+        self.assertEqual(len(ok_attempts), 1)
+        self.assertEqual(ok_attempts[0].decision, "executed")
+        self.assertEqual(
+            PriceObservation.objects.filter(share=self.share).count(), 1
+        )
+        s_ok.refresh_from_db()
+        self.assertEqual(s_ok.state, "triggered")
+        s_bad.refresh_from_db()
+        self.assertEqual(s_bad.cursor_id, 0)
+
+    def test_backlog_chronology_consistent_no_backdating(self):
+        # backlog старых точек согласовывается с хронологией портфеля:
+        # исполнение — фактическое (now), НЕ время котировки; сделка
+        # новее последней ручной операции, задним числом не пишется
+        manual = self.trade(
+            self.portfolio,
+            "BUY",
+            "1",
+            "100",
+            executed_at=timezone.now() - timedelta(minutes=1),
+        )
+        strategy = self.make_strat(direction=">=", threshold="90")
+        self.add_obs(price="110", minutes=-30)  # backlog: старее ручной
+        self.assertEqual(self.process(strategy), 1)
+        attempts = self.attempts(strategy)
+        self.assertEqual(attempts[0].decision, "executed")
+        trade = attempts[0].trade
+        # время исполнения фактическое: раньше котировки быть не может
+        self.assertGreater(trade.executed_at, manual.executed_at)
+        self.assertGreater(
+            trade.executed_at, attempts[0].observation.quote_time
+        )
+        self.portfolio.refresh_from_db()
+        # cash: 1000 − 100 (ручная) − 110 (стратегия) = 790
+        self.assertEqual(str(self.portfolio.cash), "790")
+
+
+class StrategyIntegrationHttpTests(StrategyBase):
+    """Пути интеграции + владельческие HTTP-сценарии (этап 4)."""
+
+    def test_apply_prices_runs_strategy(self):
+        from dashboard.services.price_history import apply_prices
+
+        strategy = self.make_strat(direction=">=", threshold="100")
+        updated, created = apply_prices(
+            {self.share.figi: ("150", None)}, [self.share], "demo"
+        )
+        self.assertEqual(updated, 1)
+        attempts = self.attempts(strategy)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].decision, "executed")
+        self.assertEqual(str(attempts[0].trade.price), "150")
+        self.portfolio.refresh_from_db()
+        # cash тронут: 1000 − 1×150 (комиссия 0) = 850
+        self.assertEqual(str(self.portfolio.cash), "850")
+
+    def test_celery_task_runs_strategy_inline(self):
+        from unittest import mock
+
+        from dashboard import tasks
+        from dashboard.services import price_history
+
+        strategy = self.make_strat(direction=">=", threshold="90")
+        self.assertEqual(strategy.cursor_id, 0)
+        with self.settings(PRICE_SOURCE="demo"):
+            with mock.patch.object(
+                price_history,
+                "fetch_prices",
+                return_value={self.share.figi: ("95", None)},
+            ):
+                tasks.update_last_price()
+        attempts = self.attempts(strategy)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].decision, "executed")
+
+    def test_ownership_http(self):
+        strategy = self.make_strat(user=self.other)
+        self.client.force_login(self.user)
+        # чужая стратегия
+        r = self.client.post(
+            reverse("dashboard:strategy-toggle", args=[strategy.pk])
+        )
+        self.assertEqual(r.status_code, 404)
+        r = self.client.get(
+            reverse("dashboard:strategy-attempts", args=[strategy.pk])
+        )
+        self.assertEqual(r.status_code, 404)
+        # свой портфель другой стратегии? нет: чужой портфель при создании
+        r = self.client.post(
+            reverse("dashboard:strategies"),
+            {
+                "portfolio": str(self.other_portfolio.pk),
+                "share": str(self.share.id),
+                "name": "X",
+                "direction": ">=",
+                "threshold": "100",
+                "side": "BUY",
+                "quantity": "1",
+                "commission": "0",
+                "source": "demo",
+                "currency": "USD",
+                "enabled": "on",
+            },
+        )
+        self.assertEqual(r.status_code, 200)  # форма ошиблась
+        # чужой портфель не приписан
+        price_objects = []
+        from dashboard.models import Strategy
+
+        self.assertFalse(
+            Strategy.objects.filter(
+                user=self.user, portfolio=self.other_portfolio
+            ).exists()
+        )
+
+    def test_csrf_post_without_token_is_403(self):
+        import django.test
+
+        client = django.test.Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        r = client.post(
+            reverse("dashboard:strategies"),
+            {"name": "CSRFless"},
+        )
+        self.assertEqual(r.status_code, 403)
+
+    def test_source_currency_mismatch_form_errors(self):
+        from .forms import StrategyForm
+
+        form = StrategyForm(
+            user=self.user,
+            data={
+                "portfolio": str(self.portfolio.pk),
+                "share": str(self.share.id),
+                "name": "S",
+                "direction": ">=",
+                "threshold": "100",
+                "side": "BUY",
+                "quantity": "1",
+                "commission": "0",
+                "source": "tinkoff",  # портфель demo
+                "currency": "USD",
+                "enabled": "on",
+            },
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn("source", form.errors)
+        form2 = StrategyForm(
+            user=self.user,
+            data={
+                "portfolio": str(self.portfolio.pk),
+                "share": str(self.share.id),
+                "name": "S",
+                "direction": ">=",
+                "threshold": "100",
+                "side": "BUY",
+                "quantity": "1",
+                "commission": "0",
+                "source": "demo",
+                "currency": "EUR",  # портфель USD
+                "enabled": "on",
+            },
+        )
+        self.assertFalse(form2.is_valid())
+        self.assertIn("currency", form2.errors)
+        # usd — одна валюта с USD портфеля
+        form3 = StrategyForm(
+            user=self.user,
+            data={
+                "portfolio": str(self.portfolio.pk),
+                "share": str(self.share.id),
+                "name": "S",
+                "direction": ">=",
+                "threshold": "100",
+                "side": "BUY",
+                "quantity": "1",
+                "commission": "0",
+                "source": "demo",
+                "currency": "usd",
+                "enabled": "on",
+            },
+        )
+        self.assertTrue(form3.is_valid(), form3.errors)
+
+    def test_negative_quantity_invalid_form(self):
+        from .forms import StrategyForm
+
+        form = StrategyForm(
+            user=self.user,
+            data={
+                "portfolio": str(self.portfolio.pk),
+                "share": str(self.share.id),
+                "name": "S",
+                "direction": ">=",
+                "threshold": "100",
+                "side": "BUY",
+                "quantity": "-1",
+                "commission": "0",
+                "source": "demo",
+                "currency": "USD",
+                "enabled": "on",
+            },
+        )
+        self.assertFalse(form.is_valid())
+
+    def test_delete_strategy_keeps_journal(self):
+        from dashboard.models import StrategyAttempt
+
+        strategy = self.make_strat(direction=">=", threshold="100")
+        self.add_obs(price="110")
+        self.assertEqual(self.process(strategy), 1)
+        attempt_id = self.attempts(strategy)[0].id
+        trade_id = self.attempts(strategy)[0].trade_id
+        self.client.force_login(self.user)
+        r = self.client.post(
+            reverse("dashboard:strategy-delete", args=[strategy.pk])
+        )
+        self.assertEqual(r.status_code, 302)
+        attempt = StrategyAttempt.objects.get(id=attempt_id)
+        self.assertIsNone(attempt.strategy)
+        self.assertIsNotNone(attempt.trade_id)
+        self.assertEqual(attempt.trade_id, trade_id)
+        # снимки не пострадали
+        self.assertEqual(attempt.strategy_name, "S1")
+        self.assertEqual(str(attempt.observed_price), "110")

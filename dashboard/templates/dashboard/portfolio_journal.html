@@ -26,7 +26,7 @@
                     <th>Сторона</th>
                     <th>Инструмент (снимок)</th>
                     <th>Кол-во</th>
-                    <th>Цена (ручная)</th>
+                    <th>Цена исполнения</th>
                     <th>Комиссия</th>
                     <th>Время (UTC)</th>
                     {% if not page_obj.has_next and not page_obj.has_previous %}<th>Заметка</th>{% endif %}
@@ -34,7 +34,7 @@
                 </thead>
                 <tbody>
                 {% for t in trades %}
-                    <tr>
+                    <tr id="trade-{{ t.id }}">
                         <td>{{ t.id }}</td>
                         <td>
                             {% if t.side == "BUY" %}
@@ -45,7 +45,14 @@
                         </td>
                         <td>{{ t.ticker }} (figi {{ t.figi }})</td>
                         <td>{{ t.quantity }}</td>
-                        <td>{{ t.price }} {{ t.currency }}</td>
+                        <td>
+                            {{ t.price }} {{ t.currency }}
+                            {% if t.strategy_attempt %}
+                                <br>Автоматическая виртуальная операция: {{ t.strategy_attempt.strategy_name }}<br>
+                                Котировка {{ t.strategy_attempt.source }} от {{ t.strategy_attempt.quote_time|date:"d.m.Y H:i:s" }}
+                                {% if t.strategy_attempt.source == "demo" %}<strong>DEMO</strong>{% endif %}
+                            {% else %}<br>Ручная цена виртуальной сделки{% endif %}
+                        </td>
                         <td>{{ t.commission }}</td>
                         <td>{{ t.executed_at|date:"d.m.Y H:i" }}</td>
                         {% if not page_obj.has_next and not page_obj.has_previous %}<td>{{ t.note }}</td>{% endif %}

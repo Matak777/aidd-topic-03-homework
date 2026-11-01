@@ -10,11 +10,15 @@ class Share(models.Model):
 
     figi = models.CharField(max_length=255, unique=True)
     isin = models.CharField(max_length=255)
-    name = models.CharField(max_length=255, verbose_name="Наименование компании")
+    name = models.CharField(
+        max_length=255, verbose_name="Наименование компании"
+    )
     ticker = models.CharField(max_length=10, unique=True, verbose_name="Тикер")
     currency = models.CharField(max_length=20, verbose_name="Валюта")
     uid = models.CharField(max_length=255, unique=True)
-    last_price = models.FloatField(blank=True, null=True, verbose_name="Текущая цена")
+    last_price = models.FloatField(
+        blank=True, null=True, verbose_name="Текущая цена"
+    )
     # Происхождение текущей цены (fix 3): откуда попало значение last_price.
     # NULL — происхождение неизвестно (записи до миграции 0009 и вручную
     # созданные без цены); показывается пользователю честно как неизвестное.
@@ -45,7 +49,7 @@ class Share(models.Model):
     IDENTITY_FIELDS = ("figi", "uid", "ticker")
 
     def has_price_history(self) -> bool:
-        """Есть ли у акции накопленные наблюдения или портфельные операции.
+        """Есть ли связанные цены, сделки или настроенные стратегии.
 
         Операции портфелей (Trade) тоже привязывают идентичность: у акции,
         по которой есть виртуальные сделки, смена figi/uid/ticker/валюты
@@ -54,7 +58,11 @@ class Share(models.Model):
         """
         if not self.pk:
             return False
-        return self.price_observations.exists() or self.trades.exists()
+        return (
+            self.price_observations.exists()
+            or self.trades.exists()
+            or self.strategies.exists()
+        )
 
     def protected_identity_changes(self, new_values: dict) -> list[str]:
         """Поля идентичности/валюты, которые попытается изменить запись.
@@ -124,14 +132,11 @@ class PriceObservation(models.Model):
         verbose_name="Точная цена (текст Decimal)",
     )
     currency = models.CharField(max_length=20, verbose_name="Валюта")
-    source = models.CharField(
-        max_length=20, choices=SOURCE_CHOICES
-    )
+    source = models.CharField(max_length=20, choices=SOURCE_CHOICES)
     quote_time = models.DateTimeField(verbose_name="Время котировки")
     received_at = models.DateTimeField(
         auto_now_add=True, verbose_name="Время получения"
     )
-
 
     class Meta:
         verbose_name = "Наблюдение цены"
@@ -217,7 +222,9 @@ class Portfolio(models.Model):
         verbose_name="Владелец",
     )
     name = models.CharField(max_length=255, verbose_name="Название")
-    base_currency = models.CharField(max_length=20, verbose_name="Валюта портфеля")
+    base_currency = models.CharField(
+        max_length=20, verbose_name="Валюта портфеля"
+    )
     valuation_source = models.CharField(
         max_length=20,
         choices=VALUATION_SOURCE_CHOICES,
@@ -225,7 +232,9 @@ class Portfolio(models.Model):
     )
     # Точные точные Decimal-тексты (ExactAmountField): и стартовый баланс,
     # и текущий cash — источник истины для расчётов.
-    initial_cash = ExactAmountField(verbose_name="Стартовый виртуальный баланс")
+    initial_cash = ExactAmountField(
+        verbose_name="Стартовый виртуальный баланс"
+    )
     cash = ExactAmountField(verbose_name="Виртуальный денежный остаток")
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -286,8 +295,12 @@ class Trade(models.Model):
     # --- постоянный снимок идентичности на момент исполнения ---
     figi = models.CharField(max_length=63, verbose_name="FIGI (снимок)")
     ticker = models.CharField(max_length=31, verbose_name="Тикер (снимок)")
-    share_name = models.CharField(max_length=255, verbose_name="Название (снимок)")
-    share_currency = models.CharField(max_length=20, verbose_name="Валюта инструмента (снимок)")
+    share_name = models.CharField(
+        max_length=255, verbose_name="Название (снимок)"
+    )
+    share_currency = models.CharField(
+        max_length=20, verbose_name="Валюта инструмента (снимок)"
+    )
     # --- снимок исполнения ---
     side = models.CharField(
         max_length=10,
@@ -542,7 +555,9 @@ class WatchEvent(models.Model):
     ticker = models.CharField(max_length=32, default="")
     share_name = models.CharField(max_length=128, default="")
     share_currency = models.CharField(max_length=20, default="")
-    direction = models.CharField(max_length=2, choices=WatchRule.DIRECTION_CHOICES)
+    direction = models.CharField(
+        max_length=2, choices=WatchRule.DIRECTION_CHOICES
+    )
     threshold = ExactAmountField()
     source = models.CharField(max_length=20)
     currency = models.CharField(max_length=20)
@@ -570,3 +585,209 @@ class WatchEvent(models.Model):
 
     def __str__(self):
         return f"{self.ticker} {self.direction} {self.threshold} @ {self.observed_price}"
+
+
+class Strategy(models.Model):
+    """Стратегия виртуальных сделок (группа 4, этап HOMEWORK.md).
+
+    Условие и state machine согласованы с WatchRule (те же имена полей
+    share/source/currency/direction/threshold/state/cursor_id/
+    head_quote_time): сервис переиспользует условия мониторинга
+    (`watch_monitor`). Сделки только виртуальные через
+    `portfolio_accounting.execute_trade` в привязанный портфель.
+    """
+
+    DIRECTION_GTE = WatchRule.DIRECTION_GTE
+    DIRECTION_LTE = WatchRule.DIRECTION_LTE
+    DIRECTION_CHOICES = WatchRule.DIRECTION_CHOICES
+    STATE_ARMED = WatchRule.STATE_ARMED
+    STATE_TRIGGERED = WatchRule.STATE_TRIGGERED
+    STATE_CHOICES = WatchRule.STATE_CHOICES
+    SIDE_CHOICES = [
+        ("BUY", "Покупка (BUY)"),
+        ("SELL", "Продажа (SELL)"),
+    ]
+
+    user = models.ForeignKey(
+        getattr(settings, "AUTH_USER_MODEL", "auth.User"),
+        on_delete=models.CASCADE,
+        related_name="strategies",
+        verbose_name="Владелец",
+    )
+    portfolio = models.ForeignKey(
+        Portfolio,
+        on_delete=models.PROTECT,
+        related_name="strategies",
+        verbose_name="Целевой портфель",
+    )
+    share = models.ForeignKey(
+        Share,
+        on_delete=models.CASCADE,
+        related_name="strategies",
+        verbose_name="Инструмент",
+    )
+    name = models.CharField(max_length=255, verbose_name="Название")
+    direction = models.CharField(
+        max_length=2,
+        choices=DIRECTION_CHOICES,
+        verbose_name="Направление",
+    )
+    threshold = ExactAmountField(verbose_name="Порог (> 0)")
+    side = models.CharField(max_length=4, choices=SIDE_CHOICES)
+    quantity = ExactAmountField(verbose_name="Количество (> 0)")
+    commission = ExactAmountField(default="0", verbose_name="Комиссия (>= 0)")
+    source = models.CharField(
+        max_length=20,
+        choices=PriceObservation.SOURCE_CHOICES,
+        verbose_name="Источник оценки",
+    )
+    currency = models.CharField(max_length=20, verbose_name="Валюта")
+    enabled = models.BooleanField(default=True, verbose_name="Включено")
+    state = models.CharField(
+        max_length=16,
+        choices=STATE_CHOICES,
+        default=STATE_ARMED,
+        verbose_name="Состояние",
+    )
+    cursor_id = models.BigIntegerField(
+        default=0,
+        verbose_name="Курсор обработанных наблюдений",
+    )
+    head_quote_time = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name="Время последнего применённого состояния",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Стратегия"
+        verbose_name_plural = "Стратегии"
+        indexes = [
+            models.Index(fields=["share", "enabled"]),
+            models.Index(fields=["portfolio", "enabled"]),
+        ]
+        ordering = ["id"]
+
+    def save(self, *args, **kwargs):
+        self.currency = (self.currency or "").strip().upper()
+        super().save(*args, **kwargs)
+
+    @property
+    def threshold_decimal(self):
+        return Decimal(self.threshold)
+
+    @property
+    def quantity_decimal(self) -> Decimal:
+        return Decimal(self.quantity)
+
+    @property
+    def commission_decimal(self) -> Decimal:
+        return Decimal(self.commission or "0")
+
+    def is_demo(self) -> bool:
+        return self.source == PriceObservation.SOURCE_DEMO
+
+    def __str__(self):
+        return (
+            f"{self.name}: {self.share.ticker} {self.direction} "
+            f"{self.threshold} → {self.side} {self.quantity}"
+        )
+
+
+class StrategyAttempt(models.Model):
+    """Постоянный журнал попыток стратегии (F4.3).
+
+    Снимок параметров/наблюдения/решения/причины/связанной сделки;
+    изменение/удаление стратегии/портфеля/операции не переписывает
+    записи (SET_NULL). Дубль исключён уникальностью
+    (стратегия, наблюдение) — ключ идемпотентности сделки
+    `strategy:{id}:obs:{id}` согласован с execute_trade.
+    """
+
+    DECISION_EXECUTED = "executed"
+    DECISION_REJECTED = "rejected"
+    DECISION_CHOICES = [
+        (DECISION_EXECUTED, "Сделка исполнена"),
+        (DECISION_REJECTED, "Отказано"),
+    ]
+
+    user = models.ForeignKey(
+        getattr(settings, "AUTH_USER_MODEL", "auth.User"),
+        on_delete=models.CASCADE,
+        related_name="strategy_attempts",
+        verbose_name="Владелец",
+    )
+    strategy = models.ForeignKey(
+        Strategy,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="attempts",
+        verbose_name="Стратегия",
+    )
+    observation = models.ForeignKey(
+        PriceObservation,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="strategy_attempts",
+        verbose_name="Наблюдение",
+    )
+    portfolio = models.ForeignKey(
+        Portfolio,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="strategy_attempts",
+        verbose_name="Портфель",
+    )
+    trade = models.ForeignKey(
+        "Trade",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="strategy_attempts",
+        verbose_name="Связанная операция",
+    )
+    # снимки (на момент попытки)
+    strategy_name = models.CharField(max_length=255, default="")
+    figi = models.CharField(max_length=32, default="")
+    ticker = models.CharField(max_length=32, default="")
+    share_name = models.CharField(max_length=128, default="")
+    share_currency = models.CharField(max_length=20, default="")
+    portfolio_name = models.CharField(max_length=255, default="")
+    portfolio_currency = models.CharField(max_length=20, default="")
+    direction = models.CharField(
+        max_length=2, choices=Strategy.DIRECTION_CHOICES
+    )
+    threshold = ExactAmountField()
+    source = models.CharField(max_length=20)
+    currency = models.CharField(max_length=20)
+    side = models.CharField(max_length=4, choices=Strategy.SIDE_CHOICES)
+    quantity = ExactAmountField()
+    commission = ExactAmountField()
+    observed_price = ExactAmountField(verbose_name="Цена наблюдения (снимок)")
+    quote_time = models.DateTimeField(verbose_name="Время котировки (снимок)")
+    decision = models.CharField(max_length=16, choices=DECISION_CHOICES)
+    reason = models.CharField(max_length=255, blank=True)
+    detected_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Попытка стратегии"
+        verbose_name_plural = "Попытки стратегий"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["strategy", "observation"],
+                name="unique_strategy_attempt_observation",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["user", "-id"]),
+            models.Index(fields=["strategy", "-id"]),
+        ]
+        ordering = ["-id"]
+
+    def __str__(self):
+        return f"{self.strategy_name}: {self.decision} @ {self.observed_price}"
