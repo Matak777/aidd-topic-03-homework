@@ -83,10 +83,10 @@ SDK теперь является прямой локальной зависим
 
 ## Команды и фактические результаты
 
-Локальное окружение было создано указанным подготовленным Python 3.12.15; версии uv и Python зафиксированы выше. Основные команды настройки и проверок:
+Локальное окружение было создано подготовленным Python 3.12.15; версии uv и Python зафиксированы выше. В примере `PREPARED_PYTHON` обозначает абсолютный путь к этому интерпретатору. Основные команды настройки и проверок:
 
 ```sh
-uv venv --python /Users/makarnazarov/Documents/Codex/2026-10-24/https-github-com-aidd-mcs-aidd/work/runtime/python/cpython-3.12.15-macos-aarch64-none/bin/python3.12 /tmp/copilot-task3-clean-venv
+uv venv --python "$PREPARED_PYTHON" /tmp/copilot-task3-clean-venv
 UV_PROJECT_ENVIRONMENT=/tmp/copilot-task3-clean-venv uv sync --frozen --project .
 UV_PROJECT_ENVIRONMENT=/tmp/copilot-task3-clean-venv uv sync --frozen --project .
 uv pip check --python /tmp/copilot-task3-clean-venv/bin/python
